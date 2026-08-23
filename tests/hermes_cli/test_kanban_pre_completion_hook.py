@@ -128,3 +128,110 @@ def test_malformed_pre_completion_decision_fails_closed(kanban_home):
 
     assert events[-1]["kind"] == "completion_blocked_policy"
     assert "malformed" in json.loads(events[-1]["payload"])["reason"]
+
+
+def _install_delivery_v2_policy():
+    from plugins.delivery_v2 import before_kanban_task_complete
+
+    manager = get_plugin_manager()
+    saved = {key: list(value) for key, value in manager._hooks.items()}
+    manager._hooks.setdefault("before_kanban_task_complete", []).append(
+        before_kanban_task_complete
+    )
+    return manager, saved
+
+
+def _production_card_body():
+    return json.dumps({"delivery_v2": {
+        "classification": "PRODUCTION_CHANGE",
+        "role": "PRODUCTION_VERIFIER",
+        "state": "PRODUCTION_VERIFY",
+        "implementer": "implementer",
+    }})
+
+
+def _valid_production_receipt():
+    return {"production_receipt": {
+        "MERGED_SHA": "a" * 40,
+        "DEPLOYED_SHA": "a" * 40,
+        "PRODUCTION_URL": "https://delivery.example.invalid",
+        "DEPLOYMENT_STATUS": "SUCCESS",
+        "EXACT_SHA_MATCH": "PASS",
+        "PRODUCTION_ACCEPTANCE_PROBE": "PASS",
+        "USER_VISIBLE_DELTA_EVIDENCE": "sandbox probe",
+        "ROLLBACK_OR_REVERT_PATH": "git revert <sha>",
+        "VERIFIER": " verifier ",
+    }}
+
+
+def test_delivery_v2_plugin_blocks_then_allows_independent_receipt(kanban_home):
+    """The policy uses the typed kernel hook, not terminal text parsing."""
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="production canary", body=_production_card_body(),
+                assignee="implementer",
+            )
+            assert kb.claim_task(conn, task_id) is not None
+            assert kb.request_review(
+                conn, task_id, reviewer="verifier",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            ) is True
+            assert kb.complete_task(conn, task_id, actor=" verifier ", summary="no receipt") is False
+            assert kb.get_task(conn, task_id).status == "review"
+            assert kb.complete_task(
+                conn, task_id, actor=" VERIFIER ", summary="verified",
+                metadata=_valid_production_receipt(),
+            ) is True
+            assert kb.get_task(conn, task_id).status == "done"
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+
+def test_delivery_v2_plugin_keeps_nonproduction_completion_normal(kanban_home):
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            body = json.dumps({"delivery_v2": {
+                "classification": "NON_PRODUCTION_DELIVERABLE",
+                "role": "RESEARCHER",
+            }})
+            task_id = kb.create_task(conn, title="read-only receipt", body=body)
+            assert kb.complete_task(conn, task_id, actor="researcher", summary="inventory") is True
+            assert kb.get_task(conn, task_id).status == "done"
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+
+def test_delivery_v2_plugin_allows_verifier_owned_review_run(kanban_home):
+    """Gateway claims the reviewer before it invokes the completion boundary."""
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="production verifier run", body=_production_card_body(),
+                assignee="implementer",
+            )
+            assert kb.claim_task(conn, task_id, claimer="implementer") is not None
+            assert kb.request_review(
+                conn, task_id, reviewer="verifier",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            ) is True
+            assert kb.claim_review_task(conn, task_id, claimer="verifier") is not None
+            assert kb.complete_task(
+                conn, task_id, actor="verifier", summary="verified run",
+                metadata=_valid_production_receipt(),
+            ) is True
+            assert kb.get_task(conn, task_id).status == "done"
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
