@@ -230,6 +230,62 @@ def _role_profiles(contract: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _trusted_role_owner(
+    contract: Mapping[str, Any],
+    role: str,
+    active_profile: str,
+    provenance: Mapping[str, Any],
+) -> str:
+    """Resolve a role from native assignment/run history, including one fallback.
+
+    A task-body fallback mapping is never sufficient by itself.  Delegation is
+    admitted only after the configured role owner had a claimed run that ended
+    in a durable transient block, and the currently assigned fallback owns a
+    later active run.  This keeps provider fallback compatible with the same
+    provenance boundary used for normal role ownership.
+    """
+    profiles = _role_profiles(contract)
+    owner = profiles.get(role, "")
+    active = _identity(active_profile)
+    if active and active == owner:
+        return active
+    fallback = contract.get("fallback_profiles")
+    fallback = fallback if isinstance(fallback, Mapping) else {}
+    delegated = _identity(fallback.get(owner))
+    if (
+        not active
+        or active != delegated
+        or active != profiles.get("PLATFORM_FIXER", "")
+        or active == _identity(contract.get("implementer"))
+        or active != _identity(provenance.get("task_assignee"))
+        or active != _identity(provenance.get("run_profile"))
+        or provenance.get("run_status") != "running"
+        or provenance.get("run_ended_at") is not None
+    ):
+        return ""
+    run_started_at = provenance.get("run_started_at")
+    if not isinstance(run_started_at, int):
+        return ""
+    prior_runs = provenance.get("prior_runs")
+    if not isinstance(prior_runs, list) or not prior_runs:
+        return ""
+    prior = prior_runs[-1]
+    if not isinstance(prior, Mapping):
+        return ""
+    ended_at = prior.get("ended_at")
+    if (
+        _identity(prior.get("profile")) == owner
+        and prior.get("status") == "blocked"
+        and prior.get("outcome") == "blocked"
+        and prior.get("block_kind") == "transient"
+        and prior.get("claimed_event") is True
+        and isinstance(ended_at, int)
+        and ended_at <= run_started_at
+    ):
+        return active
+    return ""
+
+
 def transition_delivery_state(args: Mapping[str, Any], **_: Any) -> str:
     """Advance one enrolled card through the existing native Kanban state.
 
@@ -266,19 +322,23 @@ def transition_delivery_state(args: Mapping[str, Any], **_: Any) -> str:
         if current not in _STATES or next_state not in _NEXT.get(current, set()):
             return f"Error: invalid Delivery V2 transition {current} -> {next_state}."
         profiles = _role_profiles(contract)
-        owner = profiles.get(_OWNER_ROLE.get(current, ""), "")
+        current_role = _OWNER_ROLE.get(current, "")
         run_id = getattr(task, "current_run_id", None)
         try:
             worker_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
         except ValueError:
             worker_run_id = None
+        provenance = kb.active_run_provenance(conn, task)
+        trusted_owner = _trusted_role_owner(
+            contract, current_role, active_profile, provenance,
+        )
         if (
             not active_profile
             or getattr(task, "status", None) != "running"
             or run_id is None
             or worker_run_id != run_id
             or _identity(getattr(task, "assignee", None)) != active_profile
-            or (owner and active_profile != owner)
+            or not trusted_owner
         ):
             return "Error: trusted active run provenance does not own this transition."
         run = conn.execute(
@@ -294,7 +354,12 @@ def transition_delivery_state(args: Mapping[str, Any], **_: Any) -> str:
             or run["claim_lock"] != getattr(task, "claim_lock", None)
         ):
             return "Error: trusted active run provenance does not own this transition."
-        next_profile = profiles.get(_OWNER_ROLE.get(next_state, ""), "")
+        next_role = _OWNER_ROLE.get(next_state, "")
+        next_profile = (
+            active_profile
+            if next_role and next_role == current_role
+            else profiles.get(next_role, "")
+        )
         handoff = None
         if next_profile and next_profile != active_profile:
             handoff = "review" if next_state == "PRODUCT_REVIEW" else "reassign"
@@ -498,7 +563,9 @@ def before_kanban_task_complete(
     provenance = run_provenance if isinstance(run_provenance, Mapping) else {}
     implementer = _identity(contract.get("implementer"))
     verifier = _identity(provenance.get("run_profile"))
-    expected_verifier = _role_profiles(contract).get("PRODUCTION_VERIFIER", "")
+    trusted_verifier = _trusted_role_owner(
+        contract, "PRODUCTION_VERIFIER", verifier, provenance,
+    )
     now = int(time.time())
     prior_runs = {
         item.get("run_id"): item
@@ -510,7 +577,7 @@ def before_kanban_task_complete(
         issues.append("IMPLEMENTER_REQUIRED")
     if (
         not verifier
-        or verifier != expected_verifier
+        or verifier != trusted_verifier
         or verifier != _identity(provenance.get("process_profile"))
         or verifier != _identity(provenance.get("task_assignee"))
         or _identity(provenance.get("worker_task_id")) != _identity(getattr(task, "id", None))
