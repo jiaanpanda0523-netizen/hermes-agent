@@ -338,10 +338,19 @@ def _active_completion_run_provenance(
             "profile": row["profile"],
             "status": row["status"],
             "outcome": row["outcome"],
+            "started_at": int(row["started_at"]),
+            "ended_at": int(row["ended_at"]),
+            "claimed_event": bool(row["claimed_event"]),
+            "review_requested_event": bool(row["review_requested_event"]),
         }
         for row in conn.execute(
-            "SELECT id, profile, status, outcome FROM task_runs WHERE task_id = ? "
-            "AND ended_at IS NOT NULL AND profile IS NOT NULL",
+            "SELECT r.id, r.profile, r.status, r.outcome, r.started_at, r.ended_at, "
+            "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+            "AND e.run_id = r.id AND e.kind = 'claimed') AS claimed_event, "
+            "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+            "AND e.run_id = r.id AND e.kind = 'review_requested') "
+            "AS review_requested_event FROM task_runs r WHERE r.task_id = ? "
+            "AND r.ended_at IS NOT NULL AND r.profile IS NOT NULL",
             (task.id,),
         ).fetchall()
     ]
@@ -386,6 +395,21 @@ def _completion_evidence_provenance(
         and isinstance(ref.get("attachment_id"), int)
         and not isinstance(ref.get("attachment_id"), bool)
     }
+    attachment_events: dict[int, dict[str, Any]] = {}
+    for event in conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'attached' ORDER BY id",
+        (task_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(event["payload"] or "{}")
+            attachment_id = int(payload.get("attachment_id"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        attachment_events[attachment_id] = {
+            "run_id": int(event["run_id"]) if event["run_id"] is not None else None,
+            "source_url": payload.get("source_url"),
+        }
     resolved: list[dict[str, Any]] = []
     for attachment_id in sorted(ids):
         row = conn.execute(
@@ -404,6 +428,7 @@ def _completion_evidence_provenance(
             document = json.loads(data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             document = None
+        event = attachment_events.get(attachment_id, {})
         resolved.append({
             "attachment_id": int(row["id"]),
             "task_id": row["task_id"],
@@ -412,6 +437,8 @@ def _completion_evidence_provenance(
             "recorded_size": int(row["size"]),
             "uploaded_by": row["uploaded_by"],
             "created_at": int(row["created_at"]),
+            "run_id": event.get("run_id"),
+            "source_url": event.get("source_url"),
             "sha256": hashlib.sha256(data).hexdigest(),
             "document": document if isinstance(document, dict) else None,
         })
@@ -4621,6 +4648,8 @@ def store_attachment_bytes(
     *,
     content_type: Optional[str] = None,
     uploaded_by: Optional[str] = None,
+    run_id: Optional[int] = None,
+    source_url: Optional[str] = None,
     board: Optional[str] = None,
     max_bytes: Optional[int] = None,
 ) -> int:
@@ -4661,6 +4690,8 @@ def store_attachment_bytes(
             content_type=content_type,
             size=len(data),
             uploaded_by=uploaded_by,
+            run_id=run_id,
+            source_url=source_url,
         )
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
@@ -4681,6 +4712,8 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    run_id: Optional[int] = None,
+    source_url: Optional[str] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -4712,13 +4745,21 @@ def add_attachment(
                 now,
             ),
         )
+        attachment_id = int(cur.lastrowid or 0)
         _append_event(
             conn,
             task_id,
             "attached",
-            {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
+            {
+                "attachment_id": attachment_id,
+                "filename": filename.strip(),
+                "size": int(size),
+                "by": uploaded_by,
+                "source_url": source_url,
+            },
+            run_id=run_id,
         )
-        return int(cur.lastrowid or 0)
+        return attachment_id
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
@@ -5979,8 +6020,61 @@ def complete_task(
             )
             return False
         next_step = terminal_step or prior_task.current_step_key
-        cur = conn.execute(
-            """
+        if terminal_step is not None:
+            commit_now = int(time.time())
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'done',
+                       result       = ?,
+                       completed_at = ?,
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL,
+                       block_kind   = NULL,
+                       block_recurrences = 0,
+                       current_step_key = ?
+                 WHERE id = ?
+                   AND status = ?
+                   AND assignee IS ?
+                   AND current_run_id IS ?
+                   AND claim_lock IS ?
+                   AND claim_expires IS ?
+                   AND claim_expires >= ?
+                   AND worker_pid IS ?
+                   AND current_step_key IS ?
+                   AND EXISTS (
+                       SELECT 1 FROM task_runs r
+                        WHERE r.id = tasks.current_run_id
+                          AND r.task_id = tasks.id
+                          AND r.profile IS tasks.assignee
+                          AND r.status = 'running'
+                          AND r.ended_at IS NULL
+                          AND r.claim_lock IS tasks.claim_lock
+                          AND r.claim_expires IS tasks.claim_expires
+                          AND r.claim_expires >= ?
+                          AND r.worker_pid IS tasks.worker_pid
+                   )
+                """,
+                (
+                    result,
+                    now,
+                    next_step,
+                    task_id,
+                    prior_task.status,
+                    prior_task.assignee,
+                    prior_task.current_run_id,
+                    prior_task.claim_lock,
+                    prior_task.claim_expires,
+                    commit_now,
+                    prior_task.worker_pid,
+                    prior_task.current_step_key,
+                    commit_now,
+                ),
+            )
+        else:
+            cur = conn.execute(
+                """
             UPDATE tasks
                SET status       = 'done',
                    result       = ?,
@@ -5997,19 +6091,19 @@ def complete_task(
                AND current_run_id IS ?
                AND claim_lock IS ?
                AND current_step_key IS ?
-            """,
-            (
-                result,
-                now,
-                next_step,
-                task_id,
-                prior_task.status,
-                prior_task.assignee,
-                prior_task.current_run_id,
-                prior_task.claim_lock,
-                prior_task.current_step_key,
-            ),
-        )
+                """,
+                (
+                    result,
+                    now,
+                    next_step,
+                    task_id,
+                    prior_task.status,
+                    prior_task.assignee,
+                    prior_task.current_run_id,
+                    prior_task.claim_lock,
+                    prior_task.current_step_key,
+                ),
+            )
         if cur.rowcount != 1:
             return False
         prior_status = prior_task.status

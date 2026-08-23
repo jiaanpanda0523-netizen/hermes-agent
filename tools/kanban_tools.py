@@ -212,6 +212,44 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _active_attachment_run(kb, conn, task_id: str) -> Optional[tuple[str, int]]:
+    """Derive attachment identity from this dispatcher worker's live claim."""
+    import time as _time
+
+    run_id = _worker_run_id(task_id)
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip().casefold()
+    task = kb.get_task(conn, task_id)
+    if (
+        run_id is None
+        or not profile
+        or task is None
+        or task.status != "running"
+        or task.assignee != profile
+        or task.current_run_id != run_id
+        or not task.claim_lock
+        or task.claim_expires is None
+        or int(task.claim_expires) < int(_time.time())
+        or task.worker_pid != os.getpid()
+    ):
+        return None
+    run = conn.execute(
+        "SELECT profile, status, claim_lock, claim_expires, worker_pid, ended_at "
+        "FROM task_runs WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    if (
+        run is None
+        or run["profile"] != profile
+        or run["status"] != "running"
+        or run["ended_at"] is not None
+        or run["claim_lock"] != task.claim_lock
+        or run["claim_expires"] != task.claim_expires
+        or run["worker_pid"] != os.getpid()
+    ):
+        return None
+    return profile, run_id
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -1154,13 +1192,16 @@ def _handle_attach(args: dict, **kw) -> str:
     try:
         _, conn = _connect(board=board)
         try:
+            provenance = _active_attachment_run(kb, conn, tid)
+            uploader, run_id = provenance or ("agent", None)
             att_id = kb.store_attachment_bytes(
                 conn,
                 tid,
                 str(filename),
                 data,
                 content_type=content_type,
-                uploaded_by="agent",
+                uploaded_by=uploader,
+                run_id=run_id,
                 board=board,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
@@ -1178,7 +1219,9 @@ def _handle_attach(args: dict, **kw) -> str:
 _MAX_ATTACH_URL_REDIRECTS = 5
 
 
-def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[str]]:
+def _download_url_with_cap(
+    url: str, max_bytes: int,
+) -> tuple[bytes, Optional[str], str]:
     """Fetch ``url`` over http(s) with SSRF guarding, capped at ``max_bytes``.
 
     Every hop — the initial URL and each redirect target — is validated with
@@ -1235,7 +1278,7 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
                         f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
                     )
                 chunks.append(chunk)
-        return b"".join(chunks), content_type
+        return b"".join(chunks), content_type, current_url
     raise ValueError(f"too many redirects fetching {url}")
 
 
@@ -1272,7 +1315,9 @@ def _handle_attach_url(args: dict, **kw) -> str:
     content_type = args.get("content_type")
     board = args.get("board")
     try:
-        data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
+        data, fetched_ct, source_url = _download_url_with_cap(
+            url, kb.KANBAN_ATTACHMENT_MAX_BYTES,
+        )
     except ValueError as e:
         return tool_error(f"kanban_attach_url: {e}")
     except Exception as e:
@@ -1281,13 +1326,17 @@ def _handle_attach_url(args: dict, **kw) -> str:
     try:
         _, conn = _connect(board=board)
         try:
+            provenance = _active_attachment_run(kb, conn, tid)
+            uploader, run_id = provenance or ("agent", None)
             att_id = kb.store_attachment_bytes(
                 conn,
                 tid,
                 str(filename),
                 data,
                 content_type=content_type or fetched_ct,
-                uploaded_by="agent",
+                uploaded_by=uploader,
+                run_id=run_id,
+                source_url=source_url,
                 board=board,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))

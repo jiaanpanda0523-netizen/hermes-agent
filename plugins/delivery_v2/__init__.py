@@ -98,6 +98,27 @@ def _url_is_production_https(value: Any) -> bool:
     return bool(host) and host not in {"localhost", "127.0.0.1", "::1"} and not host.endswith(".invalid")
 
 
+def _authoritative_evidence_source(
+    kind: str, source_url: Any, production_url: Any, exact_sha: Any,
+) -> bool:
+    if not _url_is_production_https(source_url):
+        return False
+    source = urlparse(source_url)
+    if kind in {"merge", "rollback"}:
+        return (
+            (source.hostname or "").casefold() == "api.github.com"
+            and re.fullmatch(
+                rf"/repos/[^/]+/[^/]+/commits/{re.escape(str(exact_sha))}",
+                source.path.rstrip("/"),
+            ) is not None
+        )
+    production = urlparse(str(production_url or ""))
+    return (
+        (source.hostname or "").casefold()
+        == (production.hostname or "").casefold()
+    )
+
+
 def _workflow_state(task: Any, contract: Mapping[str, Any]) -> str:
     state = getattr(task, "current_step_key", None) or contract.get("state") or "TRIAGE"
     return str(state).strip().upper()
@@ -201,15 +222,12 @@ def transition_delivery_state(args: Mapping[str, Any], **_: Any) -> str:
     profile.  It neither creates cards nor starts a scheduler, broker or goal.
     """
     task_id = _identity(args.get("task_id"))
-    runtime_task_id = _identity(_.get("task_id"))
     worker_task_id = _identity(os.environ.get("HERMES_KANBAN_TASK"))
     next_state = str(args.get("next_state") or "").strip().upper()
     if not task_id or next_state not in _STATES:
         return "Error: task_id and a valid next_state are required."
     if (
-        not runtime_task_id
-        or runtime_task_id != task_id
-        or worker_task_id != task_id
+        worker_task_id != task_id
     ):
         return "Error: trusted current Hermes task provenance does not match target task."
     from hermes_cli import kanban_db as kb
@@ -445,10 +463,11 @@ def before_kanban_task_complete(
     expected_verifier = _role_profiles(contract).get("PRODUCTION_VERIFIER", "")
     now = int(time.time())
     prior_runs = {
-        item.get("run_id"): _identity(item.get("profile"))
+        item.get("run_id"): item
         for item in provenance.get("prior_runs", [])
         if isinstance(item, Mapping) and isinstance(item.get("run_id"), int)
     } if isinstance(provenance.get("prior_runs"), list) else {}
+    implementer_run = prior_runs.get(evidence.get("implementer_run_id"), {})
     if not implementer:
         issues.append("IMPLEMENTER_REQUIRED")
     if (
@@ -472,7 +491,14 @@ def before_kanban_task_complete(
         or evidence.get("verifier_run_id") != provenance.get("run_id")
         or not _identity(provenance.get("worker_session_id"))
         or evidence.get("verifier_session_id") != provenance.get("worker_session_id")
-        or prior_runs.get(evidence.get("implementer_run_id")) != implementer
+        or _identity(implementer_run.get("profile")) != implementer
+        or implementer_run.get("status") != "review"
+        or implementer_run.get("outcome") != "review_requested"
+        or implementer_run.get("claimed_event") is not True
+        or implementer_run.get("review_requested_event") is not True
+        or not isinstance(implementer_run.get("ended_at"), int)
+        or not isinstance(provenance.get("run_started_at"), int)
+        or implementer_run.get("ended_at") > provenance.get("run_started_at")
         or implementer == verifier
     ):
         issues.append("INDEPENDENT_PRODUCTION_VERIFIER_REQUIRED")
@@ -494,8 +520,13 @@ def before_kanban_task_complete(
         kind = str(ref.get("kind") or "").strip()
         attachment_id = ref.get("attachment_id")
         actual = resolved.get(attachment_id)
+        source_ref = ref.get("source_ref")
         seen_kinds.add(kind)
-        expected_sha = merged_sha if kind == "merge" else deployed_sha
+        expected_sha = (
+            merged_sha if kind == "merge"
+            else rollback_target if kind == "rollback"
+            else deployed_sha
+        )
         if kind not in _PRODUCTION_EVIDENCE_KINDS:
             issues.append("PRODUCTION_EVIDENCE_KIND_INVALID")
         if ref.get("scope") != "PRODUCTION":
@@ -511,6 +542,11 @@ def before_kanban_task_complete(
             or actual.get("sha256") != ref.get("sha256")
             or actual.get("recorded_size") != actual.get("size")
             or _identity(actual.get("uploaded_by")) != verifier
+            or actual.get("run_id") != provenance.get("run_id")
+            or actual.get("source_url") != source_ref
+            or not _authoritative_evidence_source(
+                kind, source_ref, evidence.get("production_url"), expected_sha,
+            )
             or not isinstance(actual.get("created_at"), int)
             or actual.get("created_at") < provenance.get("run_started_at", 0)
         ):
@@ -519,27 +555,25 @@ def before_kanban_task_complete(
         else:
             document = actual.get("document")
             document = document if isinstance(document, Mapping) else {}
-        if (
-            document.get("kind") != kind
-            or document.get("scope") != "PRODUCTION"
-            or document.get("exact_sha") != expected_sha
-            or document.get("verifier_run_id") != provenance.get("run_id")
-        ):
-            issues.append("PRODUCTION_EVIDENCE_DOCUMENT_MISMATCH")
+        if kind in {"merge", "rollback"} and document.get("sha") != expected_sha:
+            issues.append("GITHUB_COMMIT_EVIDENCE_INVALID")
         if kind == "deployment" and (
-            document.get("deployment_status") != "SUCCESS"
+            document.get("deployed_sha") != expected_sha
+            or document.get("deployment_status") != "SUCCESS"
             or document.get("production_url") != evidence.get("production_url")
         ):
             issues.append("DEPLOYMENT_EVIDENCE_INVALID")
         if kind == "acceptance" and (
-            document.get("acceptance_status") != "PASS"
+            document.get("exact_sha") != expected_sha
+            or document.get("acceptance_status") != "PASS"
             or document.get("production_url") != evidence.get("production_url")
         ):
             issues.append("ACCEPTANCE_EVIDENCE_INVALID")
-        if kind == "user_visible_delta" and not _identity(document.get("evidence")):
+        if kind == "user_visible_delta" and (
+            document.get("exact_sha") != expected_sha
+            or not _identity(document.get("evidence"))
+        ):
             issues.append("USER_VISIBLE_DELTA_EVIDENCE_REQUIRED")
-        if kind == "rollback" and document.get("rollback_target_sha") != rollback_target:
-            issues.append("ROLLBACK_EVIDENCE_INVALID")
     if not _PRODUCTION_EVIDENCE_KINDS.issubset(seen_kinds):
         issues.append("PRODUCTION_EVIDENCE_KINDS_INCOMPLETE")
     decision = _decision(issues)

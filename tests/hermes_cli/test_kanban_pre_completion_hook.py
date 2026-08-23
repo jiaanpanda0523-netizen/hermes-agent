@@ -184,6 +184,7 @@ def _valid_production_receipt():
 
 def _valid_structured_production_evidence(conn, task_id, verifier_run_id):
     exact_sha = "a" * 40
+    rollback_sha = "c" * 40
     kb._set_worker_pid(conn, task_id, os.getpid())
     implementer_run_id = conn.execute(
         "SELECT id FROM task_runs WHERE task_id = ? AND profile = 'implementer' "
@@ -192,26 +193,30 @@ def _valid_structured_production_evidence(conn, task_id, verifier_run_id):
     ).fetchone()["id"]
     refs = []
     for kind in ("merge", "deployment", "acceptance", "user_visible_delta", "rollback"):
-        document = {
-            "kind": kind,
-            "scope": "PRODUCTION",
-            "exact_sha": exact_sha,
-            "verifier_run_id": verifier_run_id,
-        }
-        if kind == "deployment":
-            document.update({
+        ref_sha = rollback_sha if kind == "rollback" else exact_sha
+        if kind in {"merge", "rollback"}:
+            document = {"sha": ref_sha}
+            source_url = f"https://api.github.com/repos/example/repo/commits/{ref_sha}"
+        elif kind == "deployment":
+            document = {
+                "deployed_sha": exact_sha,
                 "deployment_status": "SUCCESS",
                 "production_url": "https://delivery.example.com",
-            })
+            }
+            source_url = "https://delivery.example.com/.well-known/deployment.json"
         elif kind == "acceptance":
-            document.update({
+            document = {
+                "exact_sha": exact_sha,
                 "acceptance_status": "PASS",
                 "production_url": "https://delivery.example.com",
-            })
-        elif kind == "user_visible_delta":
-            document["evidence"] = "independently observed production delta"
-        elif kind == "rollback":
-            document["rollback_target_sha"] = "c" * 40
+            }
+            source_url = "https://delivery.example.com/.well-known/acceptance.json"
+        else:
+            document = {
+                "exact_sha": exact_sha,
+                "evidence": "independently observed production delta",
+            }
+            source_url = "https://delivery.example.com/.well-known/visible-delta.json"
         data = json.dumps(document, sort_keys=True).encode()
         attachment_id = kb.store_attachment_bytes(
             conn,
@@ -220,6 +225,8 @@ def _valid_structured_production_evidence(conn, task_id, verifier_run_id):
             data,
             content_type="application/json",
             uploaded_by="verifier",
+            run_id=verifier_run_id,
+            source_url=source_url,
         )
         refs.append({
             "kind": kind,
@@ -227,7 +234,8 @@ def _valid_structured_production_evidence(conn, task_id, verifier_run_id):
             "ref": f"kanban-attachment:{attachment_id}",
             "attachment_id": attachment_id,
             "sha256": hashlib.sha256(data).hexdigest(),
-            "exact_sha": exact_sha,
+            "exact_sha": ref_sha,
+            "source_ref": source_url,
         })
     metadata = _valid_production_receipt()
     metadata.pop("production_receipt")
@@ -238,7 +246,7 @@ def _valid_structured_production_evidence(conn, task_id, verifier_run_id):
         "production_url": "https://delivery.example.com",
         "deployment_status": "SUCCESS",
         "acceptance_status": "PASS",
-        "rollback_target_sha": "c" * 40,
+        "rollback_target_sha": rollback_sha,
         "ONE_BRANCH_ONE_WRITER": "PASS",
         "PRODUCT_PLATFORM_PR_SEPARATION": "PASS",
         "HEAD_FROZEN": "PASS",
@@ -515,13 +523,13 @@ def test_phase_b_transition_persists_steps_and_hands_off_review(kanban_home, mon
 
     assert "READY -> IMPLEMENTING" in transition_delivery_state({
         "task_id": task_id, "next_state": "IMPLEMENTING",
-    }, task_id=task_id)
+    }, task_id="conversation-runtime-uuid")
     assert "IMPLEMENTING -> PREVIEW_READY" in transition_delivery_state({
         "task_id": task_id, "next_state": "PREVIEW_READY",
-    }, task_id=task_id)
+    }, task_id="conversation-runtime-uuid")
     assert "PREVIEW_READY -> PRODUCT_REVIEW" in transition_delivery_state({
         "task_id": task_id, "next_state": "PRODUCT_REVIEW",
-    }, task_id=task_id)
+    }, task_id="conversation-runtime-uuid")
 
     conn = kb.connect()
     try:
@@ -995,6 +1003,202 @@ def test_production_completion_rejects_expired_claim_provenance(
                     conn, task_id, verifier_run_id,
                 ),
                 expected_run_id=verifier_run_id,
+            ) is False
+            assert kb.get_task(conn, task_id).status == "running"
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+
+def test_native_attach_url_stamps_active_run_and_source_provenance(
+    kanban_home, monkeypatch,
+):
+    from tools import kanban_tools
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="native evidence fetch", assignee="verifier",
+        )
+        assert kb.claim_task(conn, task_id, claimer="verifier") is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+        kb._set_worker_pid(conn, task_id, os.getpid())
+    finally:
+        conn.close()
+    source_url = "https://api.github.com/repos/example/repo/commits/" + "a" * 40
+    data = json.dumps({"sha": "a" * 40}).encode()
+    monkeypatch.setenv("HERMES_PROFILE", "verifier")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setattr(
+        kanban_tools,
+        "_download_url_with_cap",
+        lambda *_: (data, "application/json", source_url),
+    )
+
+    result = json.loads(kanban_tools._handle_attach_url({
+        "task_id": task_id,
+        "url": source_url,
+        "filename": "merge.json",
+    }))
+    assert result["ok"] is True
+    conn = kb.connect()
+    try:
+        attachment = kb.get_attachment(conn, result["attachment_id"])
+        event = conn.execute(
+            "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'attached' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert attachment.uploaded_by == "verifier"
+    assert event["run_id"] == run_id
+    assert json.loads(event["payload"])["source_url"] == source_url
+
+
+def test_hashed_local_self_report_without_fetched_source_is_rejected(
+    kanban_home, monkeypatch,
+):
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="locally authored evidence", body=_production_card_body(),
+                assignee="implementer",
+            )
+            assert kb.set_task_workflow_step(
+                conn, task_id, workflow_template_id="anveros-delivery-v2",
+                current_step_key="PRODUCTION_VERIFY",
+            )
+            assert kb.claim_task(conn, task_id, claimer="implementer") is not None
+            assert kb.request_review(
+                conn, task_id, reviewer="verifier",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            )
+            assert kb.claim_review_task(conn, task_id, claimer="verifier") is not None
+            verifier_run_id = kb.get_task(conn, task_id).current_run_id
+            monkeypatch.setenv("HERMES_PROFILE", "verifier")
+            monkeypatch.setenv("HERMES_SESSION_ID", "session-verifier-1")
+            monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(verifier_run_id))
+            metadata = _valid_structured_production_evidence(
+                conn, task_id, verifier_run_id,
+            )
+            merge_id = metadata["production_evidence"]["refs"][0]["attachment_id"]
+            row = conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'attached' ORDER BY id",
+                (task_id,),
+            ).fetchall()[0]
+            payload = json.loads(row["payload"])
+            assert payload["attachment_id"] == merge_id
+            payload["source_url"] = None
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), row["id"]),
+            )
+            assert kb.complete_task(
+                conn, task_id, actor="verifier", summary="local self report",
+                metadata=metadata, expected_run_id=verifier_run_id,
+            ) is False
+            assert kb.get_task(conn, task_id).status == "running"
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+
+def test_failed_implementer_run_cannot_satisfy_structural_separation(
+    kanban_home, monkeypatch,
+):
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="failed implementer provenance", body=_production_card_body(),
+                assignee="implementer",
+            )
+            assert kb.set_task_workflow_step(
+                conn, task_id, workflow_template_id="anveros-delivery-v2",
+                current_step_key="PRODUCTION_VERIFY",
+            )
+            assert kb.claim_task(conn, task_id, claimer="implementer") is not None
+            assert kb.block_task(
+                conn, task_id, reason="implementation crashed", kind="transient",
+            )
+            assert kb.unblock_task(conn, task_id)
+            assert kb.assign_task(conn, task_id, "verifier")
+            assert kb.claim_task(conn, task_id, claimer="verifier") is not None
+            verifier_run_id = kb.get_task(conn, task_id).current_run_id
+            monkeypatch.setenv("HERMES_PROFILE", "verifier")
+            monkeypatch.setenv("HERMES_SESSION_ID", "session-verifier-1")
+            monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(verifier_run_id))
+            assert kb.complete_task(
+                conn, task_id, actor="verifier", summary="failed implementer",
+                metadata=_valid_structured_production_evidence(
+                    conn, task_id, verifier_run_id,
+                ),
+                expected_run_id=verifier_run_id,
+            ) is False
+            assert kb.get_task(conn, task_id).status == "running"
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+
+def test_final_done_cas_rejects_claim_expiry_after_policy_approval(
+    kanban_home, monkeypatch,
+):
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="claim expires before DONE CAS", body=_production_card_body(),
+                assignee="implementer",
+            )
+            assert kb.set_task_workflow_step(
+                conn, task_id, workflow_template_id="anveros-delivery-v2",
+                current_step_key="PRODUCTION_VERIFY",
+            )
+            assert kb.claim_task(conn, task_id, claimer="implementer") is not None
+            assert kb.request_review(
+                conn, task_id, reviewer="verifier",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            )
+            assert kb.claim_review_task(conn, task_id, claimer="verifier") is not None
+            verifier_run_id = kb.get_task(conn, task_id).current_run_id
+            monkeypatch.setenv("HERMES_PROFILE", "verifier")
+            monkeypatch.setenv("HERMES_SESSION_ID", "session-verifier-1")
+            monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(verifier_run_id))
+            metadata = _valid_structured_production_evidence(
+                conn, task_id, verifier_run_id,
+            )
+            original = kb._before_kanban_task_complete
+
+            def expire_after_policy(local_conn, local_task_id, **kwargs):
+                decision = original(local_conn, local_task_id, **kwargs)
+                local_conn.execute(
+                    "UPDATE tasks SET claim_expires = 1 WHERE id = ?",
+                    (local_task_id,),
+                )
+                local_conn.execute(
+                    "UPDATE task_runs SET claim_expires = 1 WHERE id = ?",
+                    (verifier_run_id,),
+                )
+                return decision
+
+            monkeypatch.setattr(kb, "_before_kanban_task_complete", expire_after_policy)
+            assert kb.complete_task(
+                conn, task_id, actor="verifier", summary="expiry race",
+                metadata=metadata, expected_run_id=verifier_run_id,
             ) is False
             assert kb.get_task(conn, task_id).status == "running"
         finally:
