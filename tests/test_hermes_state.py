@@ -306,12 +306,19 @@ class TestSessionLifecycle:
         db.create_session(session_id="s1", source="tui")
         db.append_message("s1", role="user", content="old request")
         db.append_message("s1", role="assistant", content="old result")
+        db.append_message("s1", role="user", content="rewound request")
+        db.append_message("s1", role="assistant", content="rewound result")
         db.append_message("s1", role="user", content="current request")
         db.append_message("s1", role="assistant", content="current result")
         db._conn.execute(
             "UPDATE messages SET active=0, compacted=1 "
             "WHERE session_id=? AND content IN (?, ?)",
             ("s1", "old request", "old result"),
+        )
+        db._conn.execute(
+            "UPDATE messages SET active=0, compacted=0 "
+            "WHERE session_id=? AND content IN (?, ?)",
+            ("s1", "rewound request", "rewound result"),
         )
         db._conn.commit()
 
