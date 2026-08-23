@@ -471,6 +471,46 @@ def test_phase_b_verifier_block_reassigns_same_card_to_platform_fixer(kanban_hom
         conn.close()
 
 
+def test_phase_b_transient_verifier_block_resumes_same_card_with_fixer(kanban_home):
+    from plugins.delivery_v2 import on_kanban_task_blocked
+
+    body = json.loads(_phase_b_card_body())
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="transient verifier fallback", body=json.dumps(body),
+            assignee="verifier",
+        )
+        assert kb.set_task_workflow_step(
+            conn, task_id, workflow_template_id="anveros-delivery-v2",
+            current_step_key="PRODUCT_REVIEW",
+        )
+        assert kb.block_task(conn, task_id, reason="provider unavailable", kind="transient")
+        task_count = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    on_kanban_task_blocked(
+        task_id=task_id, board="default", assignee="verifier",
+        reason="provider unavailable",
+    )
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.assignee == "ops"
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == task_count
+        kinds = [
+            row["kind"] for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        ]
+        assert kinds[-3:] == ["blocked", "assigned", "unblocked"]
+    finally:
+        conn.close()
+
+
 def test_phase_b_completion_observer_closes_the_durable_workflow(kanban_home):
     from plugins.delivery_v2 import on_kanban_task_completed
 

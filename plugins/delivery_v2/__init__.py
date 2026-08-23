@@ -331,6 +331,8 @@ def on_kanban_task_blocked(
             reclaim_first=getattr(task, "status", None) == "running",
             reason=f"delivery_v2_verifier_block:{state}",
         )
+        if getattr(task, "block_kind", None) == "transient":
+            kb.unblock_task(conn, task_id)
     finally:
         conn.close()
 
