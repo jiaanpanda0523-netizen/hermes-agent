@@ -164,6 +164,18 @@ def _valid_production_receipt():
         "PRODUCT_PLATFORM_PR_SEPARATION": "PASS",
         "HEAD_FROZEN": "PASS",
         "VERIFIER": " verifier ",
+    }, "delivery_controls": {
+        "writer_ids": ["implementer"],
+        "product_files": ["src/product.py"],
+        "platform_files": [],
+        "preview_head_sha": "b" * 40,
+        "frozen_head_sha": "b" * 40,
+        "reviewed_head_sha": "b" * 40,
+        "post_freeze_correction_count": 0,
+        "commit_count": 1,
+        "changed_files": 1,
+        "net_lines": 20,
+        "minutes_without_preview": 5,
     }}
 
 
@@ -228,15 +240,19 @@ def test_delivery_v2_plugin_rejects_negative_delivery_controls(kanban_home):
                 conn, task_id, reviewer="verifier",
                 expected_run_id=kb.get_task(conn, task_id).current_run_id,
             ) is True
-            receipt = _valid_production_receipt()["production_receipt"]
-            receipt.update({
-                "ONE_BRANCH_ONE_WRITER": "FAIL",
-                "PRODUCT_PLATFORM_PR_SEPARATION": "FAIL",
-                "HEAD_FROZEN": "FAIL",
+            metadata = _valid_production_receipt()
+            metadata["delivery_controls"].update({
+                "writer_ids": ["implementer", "second-writer"],
+                "platform_files": [".github/workflows/ci.yml"],
+                "reviewed_head_sha": "c" * 40,
+                "commit_count": 50,
+                "changed_files": 29,
+                "net_lines": 1667,
+                "minutes_without_preview": 120,
             })
             assert kb.complete_task(
                 conn, task_id, actor="verifier", summary="negative canary",
-                metadata={"production_receipt": receipt},
+                metadata=metadata,
             ) is False
             event = conn.execute(
                 "SELECT payload FROM task_events WHERE task_id = ? "
@@ -249,9 +265,10 @@ def test_delivery_v2_plugin_rejects_negative_delivery_controls(kanban_home):
         manager._hooks = saved
 
     reason = json.loads(event["payload"])["reason"]
-    assert "ONE_BRANCH_ONE_WRITER_PASS_REQUIRED" in reason
-    assert "PRODUCT_PLATFORM_PR_SEPARATION_PASS_REQUIRED" in reason
-    assert "HEAD_FROZEN_PASS_REQUIRED" in reason
+    assert "ONE_BRANCH_ONE_WRITER_FAILED" in reason
+    assert "PRODUCT_PLATFORM_PR_MIXED" in reason
+    assert "HEAD_MOVED_AFTER_PREVIEW" in reason
+    assert "STOP_SPLIT_COMMITS" in reason
 
 
 def test_delivery_v2_plugin_allows_verifier_owned_review_run(kanban_home):
