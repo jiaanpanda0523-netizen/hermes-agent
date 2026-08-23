@@ -2,4 +2,4 @@ name: anveros-delivery-v2
 version: 1.0.0
 description: "Typed completion policy for AnverOS Delivery OS V2 enrolled Kanban cards."
 author: AnverOS
-kind: policy
+kind: standalone
