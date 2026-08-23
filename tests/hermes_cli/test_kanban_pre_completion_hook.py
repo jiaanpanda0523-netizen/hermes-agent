@@ -160,6 +160,9 @@ def _valid_production_receipt():
         "PRODUCTION_ACCEPTANCE_PROBE": "PASS",
         "USER_VISIBLE_DELTA_EVIDENCE": "sandbox probe",
         "ROLLBACK_OR_REVERT_PATH": "git revert <sha>",
+        "ONE_BRANCH_ONE_WRITER": "PASS",
+        "PRODUCT_PLATFORM_PR_SEPARATION": "PASS",
+        "HEAD_FROZEN": "PASS",
         "VERIFIER": " verifier ",
     }}
 
@@ -208,6 +211,47 @@ def test_delivery_v2_plugin_keeps_nonproduction_completion_normal(kanban_home):
             conn.close()
     finally:
         manager._hooks = saved
+
+
+def test_delivery_v2_plugin_rejects_negative_delivery_controls(kanban_home):
+    """#701-shaped evidence cannot be promoted by activity or a preview."""
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="negative delivery controls", body=_production_card_body(),
+                assignee="implementer",
+            )
+            assert kb.claim_task(conn, task_id, claimer="implementer") is not None
+            assert kb.request_review(
+                conn, task_id, reviewer="verifier",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            ) is True
+            receipt = _valid_production_receipt()["production_receipt"]
+            receipt.update({
+                "ONE_BRANCH_ONE_WRITER": "FAIL",
+                "PRODUCT_PLATFORM_PR_SEPARATION": "FAIL",
+                "HEAD_FROZEN": "FAIL",
+            })
+            assert kb.complete_task(
+                conn, task_id, actor="verifier", summary="negative canary",
+                metadata={"production_receipt": receipt},
+            ) is False
+            event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'completion_blocked_policy' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+    reason = json.loads(event["payload"])["reason"]
+    assert "ONE_BRANCH_ONE_WRITER_PASS_REQUIRED" in reason
+    assert "PRODUCT_PLATFORM_PR_SEPARATION_PASS_REQUIRED" in reason
+    assert "HEAD_FROZEN_PASS_REQUIRED" in reason
 
 
 def test_delivery_v2_plugin_allows_verifier_owned_review_run(kanban_home):
