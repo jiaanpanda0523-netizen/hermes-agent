@@ -1178,7 +1178,9 @@ def _handle_attach(args: dict, **kw) -> str:
 _MAX_ATTACH_URL_REDIRECTS = 5
 
 
-def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[str]]:
+def _download_url_with_cap(
+    url: str, max_bytes: int,
+) -> tuple[bytes, Optional[str], str]:
     """Fetch ``url`` over http(s) with SSRF guarding, capped at ``max_bytes``.
 
     Every hop — the initial URL and each redirect target — is validated with
@@ -1235,7 +1237,7 @@ def _download_url_with_cap(url: str, max_bytes: int) -> tuple[bytes, Optional[st
                         f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
                     )
                 chunks.append(chunk)
-        return b"".join(chunks), content_type
+        return b"".join(chunks), content_type, current_url
     raise ValueError(f"too many redirects fetching {url}")
 
 
@@ -1272,25 +1274,32 @@ def _handle_attach_url(args: dict, **kw) -> str:
     content_type = args.get("content_type")
     board = args.get("board")
     try:
-        data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
-    except ValueError as e:
-        return tool_error(f"kanban_attach_url: {e}")
-    except Exception as e:
-        logger.exception("kanban_attach_url download failed")
-        return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
-    try:
         _, conn = _connect(board=board)
         try:
-            att_id = kb.store_attachment_bytes(
-                conn,
-                tid,
-                str(filename),
-                data,
-                content_type=content_type or fetched_ct,
-                uploaded_by="agent",
-                board=board,
-            )
-            return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+            if _worker_run_id(tid) is None:
+                data, fetched_type, _ = _download_url_with_cap(
+                    url, kb.KANBAN_ATTACHMENT_MAX_BYTES,
+                )
+                att_id = kb.store_attachment_bytes(
+                    conn,
+                    tid,
+                    str(filename),
+                    data,
+                    content_type=content_type or fetched_type,
+                    uploaded_by="agent",
+                    board=board,
+                )
+                size = len(data)
+            else:
+                att_id, size = kb.store_attachment_from_url(
+                    conn,
+                    tid,
+                    url,
+                    str(filename),
+                    content_type=content_type,
+                    board=board,
+                )
+            return _ok(task_id=tid, attachment_id=att_id, size=size)
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:

@@ -9,6 +9,7 @@ the authoritative kernel passes to it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from collections.abc import Mapping
@@ -19,22 +20,16 @@ from urllib.parse import urlparse
 PRODUCTION_CHANGE = "PRODUCTION_CHANGE"
 NON_PRODUCTION_DELIVERABLE = "NON_PRODUCTION_DELIVERABLE"
 _TASK_CLASSES = {PRODUCTION_CHANGE, NON_PRODUCTION_DELIVERABLE}
-_REQUIRED_RECEIPT = (
-    "MERGED_SHA",
-    "DEPLOYED_SHA",
-    "PRODUCTION_URL",
-    "DEPLOYMENT_STATUS",
-    "EXACT_SHA_MATCH",
-    "PRODUCTION_ACCEPTANCE_PROBE",
-    "USER_VISIBLE_DELTA_EVIDENCE",
-    "ROLLBACK_OR_REVERT_PATH",
-)
 _REQUIRED_DELIVERY_CONTROLS = (
     "ONE_BRANCH_ONE_WRITER",
     "PRODUCT_PLATFORM_PR_SEPARATION",
     "HEAD_FROZEN",
 )
 _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_SHA256 = re.compile(r"[0-9a-f]{64}$")
+_PRODUCTION_EVIDENCE_KINDS = {
+    "merge", "deployment", "acceptance", "user_visible_delta", "rollback",
+}
 WORKFLOW_TEMPLATE = "anveros-delivery-v2"
 _STRICT_AFTER_EPOCH: int | None = None
 _STATES = (
@@ -94,6 +89,50 @@ def _url_is_https(value: Any) -> bool:
     except ValueError:
         return False
     return parsed.scheme == "https" and bool(parsed.netloc)
+
+
+def _url_is_production_https(value: Any) -> bool:
+    if not _url_is_https(value):
+        return False
+    host = (urlparse(value).hostname or "").casefold()
+    return bool(host) and host not in {"localhost", "127.0.0.1", "::1"} and not host.endswith(".invalid")
+
+
+def _authoritative_evidence_source(
+    kind: str,
+    source_url: Any,
+    production_url: Any,
+    exact_sha: Any,
+    contract: Mapping[str, Any],
+) -> bool:
+    if not _url_is_production_https(source_url):
+        return False
+    source = urlparse(source_url)
+    repository = str(contract.get("repository") or "").strip().casefold()
+    if kind == "merge":
+        pull_request = contract.get("pull_request_number")
+        return (
+            (source.hostname or "").casefold() == "api.github.com"
+            and isinstance(pull_request, int)
+            and not isinstance(pull_request, bool)
+            and source.path.rstrip("/").casefold()
+            == f"/repos/{repository}/pulls/{pull_request}"
+        )
+    if kind == "rollback":
+        return (
+            (source.hostname or "").casefold() == "api.github.com"
+            and source.path.rstrip("/").casefold()
+            == f"/repos/{repository}/commits/{str(exact_sha).casefold()}"
+        )
+    production = urlparse(str(production_url or ""))
+    enrolled = urlparse(str(contract.get("production_origin") or ""))
+    return (
+        (source.hostname or "").casefold()
+        == (production.hostname or "").casefold()
+        == (enrolled.hostname or "").casefold()
+        and source.scheme == production.scheme == enrolled.scheme == "https"
+        and source.port == production.port == enrolled.port
+    )
 
 
 def _workflow_state(task: Any, contract: Mapping[str, Any]) -> str:
@@ -199,11 +238,23 @@ def transition_delivery_state(args: Mapping[str, Any], **_: Any) -> str:
     profile.  It neither creates cards nor starts a scheduler, broker or goal.
     """
     task_id = _identity(args.get("task_id"))
-    actor = _identity(args.get("actor"))
+    worker_task_id = _identity(os.environ.get("HERMES_KANBAN_TASK"))
     next_state = str(args.get("next_state") or "").strip().upper()
-    if not task_id or not actor or next_state not in _STATES:
-        return "Error: task_id, actor, and a valid next_state are required."
+    if not task_id or next_state not in _STATES:
+        return "Error: task_id and a valid next_state are required."
+    if (
+        worker_task_id != task_id
+    ):
+        return "Error: trusted current Hermes task provenance does not match target task."
     from hermes_cli import kanban_db as kb
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        active_profile = _identity(
+            os.environ.get("HERMES_PROFILE") or get_active_profile_name()
+        )
+    except Exception:
+        active_profile = _identity(os.environ.get("HERMES_PROFILE"))
 
     conn = kb.connect()
     try:
@@ -216,39 +267,55 @@ def transition_delivery_state(args: Mapping[str, Any], **_: Any) -> str:
             return f"Error: invalid Delivery V2 transition {current} -> {next_state}."
         profiles = _role_profiles(contract)
         owner = profiles.get(_OWNER_ROLE.get(current, ""), "")
-        if owner and actor != owner:
-            return f"Error: {actor} is not the owner of {current}."
-        if not kb.set_task_workflow_step(
-            conn,
-            task_id,
-            workflow_template_id=WORKFLOW_TEMPLATE,
-            current_step_key=next_state,
-            expected_current_step_key=getattr(task, "current_step_key", None),
-            reason=f"delivery_v2:{current}->{next_state}:actor={actor}",
+        run_id = getattr(task, "current_run_id", None)
+        try:
+            worker_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+        except ValueError:
+            worker_run_id = None
+        if (
+            not active_profile
+            or getattr(task, "status", None) != "running"
+            or run_id is None
+            or worker_run_id != run_id
+            or _identity(getattr(task, "assignee", None)) != active_profile
+            or (owner and active_profile != owner)
         ):
-            return "Error: concurrent Delivery V2 transition; reread the card."
-
+            return "Error: trusted active run provenance does not own this transition."
+        run = conn.execute(
+            "SELECT profile, status, claim_lock, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (int(run_id), task_id),
+        ).fetchone()
+        if (
+            run is None
+            or _identity(run["profile"]) != active_profile
+            or run["status"] != "running"
+            or run["ended_at"] is not None
+            or run["claim_lock"] != getattr(task, "claim_lock", None)
+        ):
+            return "Error: trusted active run provenance does not own this transition."
         next_profile = profiles.get(_OWNER_ROLE.get(next_state, ""), "")
-        if next_profile and next_profile != _identity(getattr(task, "assignee", None)):
-            if next_state == "PRODUCT_REVIEW":
-                kb.request_review(
-                    conn,
-                    task_id,
-                    reviewer=next_profile,
-                    expected_run_id=(
-                        getattr(task, "current_run_id", None)
-                        if getattr(task, "status", None) == "running"
-                        else None
-                    ),
-                )
-            else:
-                kb.reassign_task(
-                    conn,
-                    task_id,
-                    next_profile,
-                    reclaim_first=getattr(task, "status", None) == "running",
-                    reason=f"delivery_v2_handoff:{current}->{next_state}",
-                )
+        handoff = None
+        if next_profile and next_profile != active_profile:
+            handoff = "review" if next_state == "PRODUCT_REVIEW" else "reassign"
+        reason = f"delivery_v2:{current}->{next_state}:run={int(run_id)}"
+        try:
+            persisted = kb.transition_workflow_task(
+                conn,
+                task_id,
+                workflow_template_id=WORKFLOW_TEMPLATE,
+                expected_current_step_key=getattr(task, "current_step_key", None),
+                current_step_key=next_state,
+                expected_assignee=active_profile,
+                expected_run_id=int(run_id),
+                next_assignee=next_profile if handoff else None,
+                handoff=handoff,
+                reason=reason,
+            )
+        except Exception as exc:
+            return f"Error: atomic Delivery V2 transition failed ({type(exc).__name__})."
+        if not persisted:
+            return "Error: concurrent or stale Delivery V2 transition; reread the card."
         return f"Delivery V2 transition persisted: {current} -> {next_state}."
     finally:
         conn.close()
@@ -285,9 +352,14 @@ def on_kanban_dispatch_tick(*, board: str | None = None, **_: Any) -> None:
                 threshold = 1800
             minimum = 1 if contract.get("canary") == "SANDBOX_ONLY" else 1800
             threshold = max(minimum, threshold)
-            if now - int(getattr(task, "created_at", now)) < threshold:
-                continue
-            kb.assign_task(conn, task.id, next_assignee)
+            kb.reroute_ready_task_once(
+                conn,
+                task.id,
+                expected_assignee=current_assignee,
+                next_assignee=next_assignee,
+                threshold_seconds=threshold,
+                now=now,
+            )
     finally:
         conn.close()
 
@@ -338,7 +410,8 @@ def on_kanban_task_blocked(
 
 
 def before_kanban_task_complete(
-    *, task: Any, actor: str, metadata: Any, **_: Any,
+    *, task: Any, actor: str, metadata: Any,
+    run_provenance: Any = None, evidence_provenance: Any = None, **_: Any,
 ) -> dict[str, Any] | None:
     """Grandfather pre-cutover cards; fail closed for every newer task."""
     contract = _contract(task)
@@ -367,73 +440,199 @@ def before_kanban_task_complete(
     # static ``review`` card.  Identity checks below remain mandatory.
     if getattr(task, "status", None) not in {"review", "running"}:
         issues.append("INDEPENDENT_REVIEW_STATE_REQUIRED")
-    if _workflow_state(task, contract) != "PRODUCTION_VERIFY":
+    if getattr(task, "current_step_key", None) != "PRODUCTION_VERIFY":
         issues.append("PRODUCTION_VERIFY_STATE_REQUIRED")
-    receipt = metadata.get("production_receipt") if isinstance(metadata, Mapping) else None
-    if not isinstance(receipt, Mapping):
-        issues.append("PRODUCTION_RECEIPT_REQUIRED")
-        receipt = {}
-    for field in _REQUIRED_RECEIPT:
-        if not _identity(receipt.get(field)):
-            issues.append(f"{field}_REQUIRED")
-    for field in ("MERGED_SHA", "DEPLOYED_SHA"):
-        value = receipt.get(field)
+    evidence = metadata.get("production_evidence") if isinstance(metadata, Mapping) else None
+    if not isinstance(evidence, Mapping):
+        issues.append("STRUCTURED_PRODUCTION_EVIDENCE_REQUIRED")
+        evidence = {}
+    if evidence.get("scope") != "PRODUCTION":
+        issues.append("PRODUCTION_EVIDENCE_SCOPE_REQUIRED")
+    merged_sha = evidence.get("merged_sha")
+    deployed_sha = evidence.get("deployed_sha")
+    for field, value in (("MERGED_SHA", merged_sha), ("DEPLOYED_SHA", deployed_sha)):
         if not isinstance(value, str) or _SHA.fullmatch(value) is None:
             issues.append(f"{field}_INVALID")
-    if not _url_is_https(receipt.get("PRODUCTION_URL")):
+    if merged_sha != deployed_sha:
+        issues.append("EXACT_SHA_MATCH_FAILED")
+    if not _url_is_production_https(evidence.get("production_url")):
         issues.append("PRODUCTION_URL_INVALID")
-    if receipt.get("DEPLOYMENT_STATUS") != "SUCCESS":
+    production_origin = str(contract.get("production_origin") or "").rstrip("/")
+    production_url = str(evidence.get("production_url") or "")
+    parsed_production = urlparse(production_url)
+    parsed_origin = urlparse(production_origin)
+    if (
+        not _url_is_production_https(production_origin)
+        or parsed_production.scheme != parsed_origin.scheme
+        or parsed_production.hostname != parsed_origin.hostname
+        or parsed_production.port != parsed_origin.port
+    ):
+        issues.append("PRODUCTION_ORIGIN_MISMATCH")
+    repository = str(contract.get("repository") or "").strip().casefold()
+    production_branch = str(contract.get("production_branch") or "").strip()
+    pull_request_number = contract.get("pull_request_number")
+    if (
+        re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", repository) is None
+        or not production_branch
+        or not isinstance(pull_request_number, int)
+        or isinstance(pull_request_number, bool)
+        or pull_request_number < 1
+    ):
+        issues.append("DURABLE_RELEASE_TARGET_REQUIRED")
+    if evidence.get("deployment_status") != "SUCCESS":
         issues.append("DEPLOYMENT_STATUS_SUCCESS_REQUIRED")
-    for field in ("EXACT_SHA_MATCH", "PRODUCTION_ACCEPTANCE_PROBE"):
-        if receipt.get(field) != "PASS":
-            issues.append(f"{field}_PASS_REQUIRED")
+    if evidence.get("acceptance_status") != "PASS":
+        issues.append("PRODUCTION_ACCEPTANCE_PROBE_PASS_REQUIRED")
+    rollback_target = evidence.get("rollback_target_sha")
+    if (
+        not isinstance(rollback_target, str)
+        or _SHA.fullmatch(rollback_target) is None
+        or rollback_target == deployed_sha
+    ):
+        issues.append("ROLLBACK_TARGET_SHA_INVALID")
     for field in _REQUIRED_DELIVERY_CONTROLS:
-        if receipt.get(field) != "PASS":
+        if evidence.get(field) != "PASS":
             issues.append(f"{field}_PASS_REQUIRED")
     issues.extend(_delivery_control_issues(metadata, contract))
-    if receipt.get("MERGED_SHA") != receipt.get("DEPLOYED_SHA"):
-        issues.append("EXACT_SHA_MATCH_FAILED")
 
+    provenance = run_provenance if isinstance(run_provenance, Mapping) else {}
     implementer = _identity(contract.get("implementer"))
-    verifier = _identity(receipt.get("VERIFIER"))
+    verifier = _identity(provenance.get("run_profile"))
+    expected_verifier = _role_profiles(contract).get("PRODUCTION_VERIFIER", "")
+    now = int(time.time())
+    prior_runs = {
+        item.get("run_id"): item
+        for item in provenance.get("prior_runs", [])
+        if isinstance(item, Mapping) and isinstance(item.get("run_id"), int)
+    } if isinstance(provenance.get("prior_runs"), list) else {}
+    implementer_run = prior_runs.get(evidence.get("implementer_run_id"), {})
     if not implementer:
         issues.append("IMPLEMENTER_REQUIRED")
-    if not verifier:
-        issues.append("VERIFIER_REQUIRED")
-    if not implementer or not verifier or implementer == verifier or _identity(actor) != verifier:
+    if (
+        not verifier
+        or verifier != expected_verifier
+        or verifier != _identity(provenance.get("process_profile"))
+        or verifier != _identity(provenance.get("task_assignee"))
+        or _identity(provenance.get("worker_task_id")) != _identity(getattr(task, "id", None))
+        or provenance.get("worker_run_id") != provenance.get("run_id")
+        or provenance.get("task_current_run_id") != provenance.get("run_id")
+        or provenance.get("run_status") != "running"
+        or provenance.get("run_ended_at") is not None
+        or not provenance.get("task_claim_lock")
+        or provenance.get("task_claim_lock") != provenance.get("run_claim_lock")
+        or not isinstance(provenance.get("task_claim_expires"), int)
+        or provenance.get("task_claim_expires") < now
+        or not isinstance(provenance.get("run_claim_expires"), int)
+        or provenance.get("run_claim_expires") < now
+        or provenance.get("task_worker_pid") != provenance.get("process_pid")
+        or provenance.get("run_worker_pid") != provenance.get("process_pid")
+        or evidence.get("verifier_run_id") != provenance.get("run_id")
+        or not _identity(provenance.get("worker_session_id"))
+        or evidence.get("verifier_session_id") != provenance.get("worker_session_id")
+        or _identity(implementer_run.get("profile")) != implementer
+        or implementer_run.get("status") != "review"
+        or implementer_run.get("outcome") != "review_requested"
+        or implementer_run.get("claimed_event") is not True
+        or implementer_run.get("review_requested_event") is not True
+        or not isinstance(implementer_run.get("ended_at"), int)
+        or not isinstance(provenance.get("run_started_at"), int)
+        or implementer_run.get("ended_at") > provenance.get("run_started_at")
+        or implementer == verifier
+    ):
         issues.append("INDEPENDENT_PRODUCTION_VERIFIER_REQUIRED")
-    return _decision(issues)
 
-
-def on_kanban_task_completed(*, task_id: str, board: str | None = None, **_: Any) -> None:
-    """Close the enrolled workflow after the native completion transaction.
-
-    ``before_kanban_task_complete`` is deliberately the sole synchronous
-    boundary.  This observer runs only after native Kanban has durably marked
-    the card done, then records the matching Delivery V2 terminal step on the
-    same task row.  A failed observer cannot turn a completed card into a
-    false success because the pre-completion receipt gate has already run.
-    """
-    if not task_id:
-        return
-    from hermes_cli import kanban_db as kb
-
-    conn = kb.connect(board=board)
-    try:
-        task = kb.get_task(conn, task_id)
-        contract = _contract(task) if task is not None else None
-        if contract is None or _workflow_state(task, contract) != "PRODUCTION_VERIFY":
-            return
-        kb.set_task_workflow_step(
-            conn,
-            task_id,
-            workflow_template_id=WORKFLOW_TEMPLATE,
-            current_step_key="DONE",
-            expected_current_step_key=getattr(task, "current_step_key", None),
-            reason="delivery_v2:PRODUCTION_VERIFY->DONE:native_completion",
+    resolved = {
+        item.get("attachment_id"): item
+        for item in evidence_provenance
+        if isinstance(item, Mapping)
+    } if isinstance(evidence_provenance, list) else {}
+    refs = evidence.get("refs")
+    seen_kinds: set[str] = set()
+    if not isinstance(refs, list):
+        issues.append("PRODUCTION_EVIDENCE_REFS_REQUIRED")
+        refs = []
+    for ref in refs:
+        if not isinstance(ref, Mapping):
+            issues.append("PRODUCTION_EVIDENCE_REF_MALFORMED")
+            continue
+        kind = str(ref.get("kind") or "").strip()
+        attachment_id = ref.get("attachment_id")
+        actual = resolved.get(attachment_id)
+        source_ref = ref.get("source_ref")
+        seen_kinds.add(kind)
+        expected_sha = (
+            merged_sha if kind == "merge"
+            else rollback_target if kind == "rollback"
+            else deployed_sha
         )
-    finally:
-        conn.close()
+        if kind not in _PRODUCTION_EVIDENCE_KINDS:
+            issues.append("PRODUCTION_EVIDENCE_KIND_INVALID")
+        if ref.get("scope") != "PRODUCTION":
+            issues.append("SANDBOX_EVIDENCE_FORBIDDEN")
+        if ref.get("ref") != f"kanban-attachment:{attachment_id}":
+            issues.append("PRODUCTION_EVIDENCE_REF_INVALID")
+        if not isinstance(ref.get("sha256"), str) or _SHA256.fullmatch(ref["sha256"]) is None:
+            issues.append("PRODUCTION_EVIDENCE_HASH_INVALID")
+        if ref.get("exact_sha") != expected_sha:
+            issues.append("PRODUCTION_EVIDENCE_EXACT_SHA_MISMATCH")
+        if (
+            actual is None
+            or actual.get("sha256") != ref.get("sha256")
+            or actual.get("fetched_sha256") != actual.get("sha256")
+            or actual.get("fetched_size") != actual.get("size")
+            or actual.get("recorded_size") != actual.get("size")
+            or _identity(actual.get("uploaded_by")) != verifier
+            or actual.get("run_id") != provenance.get("run_id")
+            or actual.get("source_url") != source_ref
+            or not _authoritative_evidence_source(
+                kind,
+                source_ref,
+                evidence.get("production_url"),
+                expected_sha,
+                contract,
+            )
+            or not isinstance(actual.get("created_at"), int)
+            or actual.get("created_at") < provenance.get("run_started_at", 0)
+        ):
+            issues.append("PRODUCTION_EVIDENCE_ATTACHMENT_UNVERIFIED")
+            document = {}
+        else:
+            document = actual.get("document")
+            document = document if isinstance(document, Mapping) else {}
+        if kind == "merge" and (
+            not _identity(document.get("merged_at"))
+            or document.get("merge_commit_sha") != expected_sha
+            or document.get("base", {}).get("ref") != production_branch
+            or _identity(document.get("base", {}).get("repo", {}).get("full_name"))
+            != repository
+            or document.get("number") != pull_request_number
+        ):
+            issues.append("GITHUB_MERGE_EVIDENCE_INVALID")
+        if kind == "rollback" and document.get("sha") != expected_sha:
+            issues.append("GITHUB_ROLLBACK_COMMIT_EVIDENCE_INVALID")
+        if kind == "deployment" and (
+            document.get("deployed_sha") != expected_sha
+            or document.get("deployment_status") != "SUCCESS"
+            or document.get("production_url") != evidence.get("production_url")
+        ):
+            issues.append("DEPLOYMENT_EVIDENCE_INVALID")
+        if kind == "acceptance" and (
+            document.get("exact_sha") != expected_sha
+            or document.get("acceptance_status") != "PASS"
+            or document.get("production_url") != evidence.get("production_url")
+        ):
+            issues.append("ACCEPTANCE_EVIDENCE_INVALID")
+        if kind == "user_visible_delta" and (
+            document.get("exact_sha") != expected_sha
+            or not _identity(document.get("evidence"))
+        ):
+            issues.append("USER_VISIBLE_DELTA_EVIDENCE_REQUIRED")
+    if not _PRODUCTION_EVIDENCE_KINDS.issubset(seen_kinds):
+        issues.append("PRODUCTION_EVIDENCE_KINDS_INCOMPLETE")
+    decision = _decision(issues)
+    if decision.get("allow") is True:
+        decision["workflow_terminal_step"] = "DONE"
+    return decision
 
 
 def _decision(issues: list[str]) -> dict[str, Any]:
@@ -455,7 +654,6 @@ def register(ctx) -> None:
     ctx.register_hook("before_kanban_task_complete", before_kanban_task_complete)
     ctx.register_hook("on_kanban_dispatch_tick", on_kanban_dispatch_tick)
     ctx.register_hook("kanban_task_blocked", on_kanban_task_blocked)
-    ctx.register_hook("kanban_task_completed", on_kanban_task_completed)
     ctx.register_tool(
         name="delivery_v2_transition",
         toolset="kanban",
@@ -466,10 +664,9 @@ def register(ctx) -> None:
                 "type": "object",
                 "properties": {
                     "task_id": {"type": "string"},
-                    "actor": {"type": "string"},
                     "next_state": {"type": "string", "enum": list(_STATES)},
                 },
-                "required": ["task_id", "actor", "next_state"],
+                "required": ["task_id", "next_state"],
             },
         },
         handler=transition_delivery_state,

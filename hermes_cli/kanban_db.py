@@ -223,27 +223,43 @@ def _completion_actor(actor: Optional[str]) -> str:
     return _canonical_assignee(candidate) or "unknown"
 
 
-def _completion_veto_reason(results: Iterable[Any]) -> Optional[str]:
-    """Normalize typed ``before_kanban_task_complete`` policy decisions."""
+def _completion_policy_decision(
+    results: Iterable[Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """Normalize vetoes plus an optional atomic terminal workflow step."""
+    terminal_step: Optional[str] = None
     for result in results:
         if result is None or result is True:
             continue
         if result is False:
-            return "completion blocked by before_kanban_task_complete policy"
+            return "completion blocked by before_kanban_task_complete policy", None
         if isinstance(result, str):
-            return result.strip() or "completion blocked by policy"
+            return result.strip() or "completion blocked by policy", None
         if isinstance(result, Mapping):
             allowed = result.get("allow")
             if allowed is True:
+                requested = result.get("workflow_terminal_step")
+                if requested is not None:
+                    requested = str(requested).strip()
+                    if not requested:
+                        return "completion policy returned empty terminal step", None
+                    if terminal_step is not None and terminal_step != requested:
+                        return "completion policies returned conflicting terminal steps", None
+                    terminal_step = requested
                 continue
             reason = result.get("reason")
             if isinstance(reason, str) and reason.strip():
-                return reason.strip()
+                return reason.strip(), None
             if allowed is False:
-                return "completion blocked by policy"
-            return "completion policy returned malformed decision"
-        return "completion policy returned unsupported decision"
-    return None
+                return "completion blocked by policy", None
+            return "completion policy returned malformed decision", None
+        return "completion policy returned unsupported decision", None
+    return None, terminal_step
+
+
+def _completion_veto_reason(results: Iterable[Any]) -> Optional[str]:
+    """Back-compatible veto-only view used by older callers/tests."""
+    return _completion_policy_decision(results)[0]
 
 
 def _before_kanban_task_complete(
@@ -254,7 +270,10 @@ def _before_kanban_task_complete(
     summary: Optional[str],
     result: Optional[str],
     metadata: Optional[dict],
-) -> Optional[str]:
+    task_snapshot: Optional[Task] = None,
+    run_provenance: Optional[dict[str, Any]] = None,
+    evidence_provenance: Optional[list[dict[str, Any]]] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """Return a veto reason before the authoritative completion write."""
     try:
         # Completion may be invoked by a worker-side Kanban tool, which does
@@ -267,10 +286,10 @@ def _before_kanban_task_complete(
         from hermes_cli.lifecycle import has_hook, invoke_hook
 
         if not has_hook("before_kanban_task_complete"):
-            return None
-        task = get_task(conn, task_id)
+            return None, None
+        task = task_snapshot or get_task(conn, task_id)
         if task is None:
-            return "task not found"
+            return "task not found", None
         decisions = invoke_hook(
             "before_kanban_task_complete",
             task_id=task_id,
@@ -280,11 +299,154 @@ def _before_kanban_task_complete(
             result=result,
             metadata=metadata,
             board=get_current_board(),
+            run_provenance=run_provenance,
+            evidence_provenance=evidence_provenance or [],
         )
-        return _completion_veto_reason(decisions)
+        return _completion_policy_decision(decisions)
     except Exception as exc:
         # A configured policy that cannot run must not become an allow.
-        return f"before_kanban_task_complete hook failed: {type(exc).__name__}"
+        return f"before_kanban_task_complete hook failed: {type(exc).__name__}", None
+
+
+def _active_completion_run_provenance(
+    conn: sqlite3.Connection, task: Task,
+) -> dict[str, Any]:
+    """Build a DB-derived claim/run identity packet for completion policy."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        process_profile = _canonical_assignee(
+            os.environ.get("HERMES_PROFILE") or get_active_profile_name()
+        )
+    except Exception:
+        process_profile = _canonical_assignee(os.environ.get("HERMES_PROFILE"))
+    try:
+        worker_run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+    except ValueError:
+        worker_run_id = None
+    run = None
+    if task.current_run_id is not None:
+        run = conn.execute(
+            "SELECT id, task_id, profile, status, claim_lock, claim_expires, "
+            "worker_pid, started_at, ended_at FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (int(task.current_run_id), task.id),
+        ).fetchone()
+    prior_runs = [
+        {
+            "run_id": int(row["id"]),
+            "profile": row["profile"],
+            "status": row["status"],
+            "outcome": row["outcome"],
+            "started_at": int(row["started_at"]),
+            "ended_at": int(row["ended_at"]),
+            "claimed_event": bool(row["claimed_event"]),
+            "review_requested_event": bool(row["review_requested_event"]),
+        }
+        for row in conn.execute(
+            "SELECT r.id, r.profile, r.status, r.outcome, r.started_at, r.ended_at, "
+            "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+            "AND e.run_id = r.id AND e.kind = 'claimed') AS claimed_event, "
+            "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+            "AND e.run_id = r.id AND e.kind = 'review_requested') "
+            "AS review_requested_event FROM task_runs r WHERE r.task_id = ? "
+            "AND r.ended_at IS NOT NULL AND r.profile IS NOT NULL",
+            (task.id,),
+        ).fetchall()
+    ]
+    return {
+        "task_id": task.id,
+        "task_assignee": task.assignee,
+        "task_status": task.status,
+        "task_current_run_id": task.current_run_id,
+        "task_claim_lock": task.claim_lock,
+        "task_claim_expires": task.claim_expires,
+        "task_worker_pid": task.worker_pid,
+        "task_session_id": task.session_id,
+        "process_profile": process_profile,
+        "process_pid": os.getpid(),
+        "worker_task_id": os.environ.get("HERMES_KANBAN_TASK"),
+        "worker_run_id": worker_run_id,
+        "worker_session_id": os.environ.get("HERMES_SESSION_ID"),
+        "run_id": int(run["id"]) if run is not None else None,
+        "run_profile": run["profile"] if run is not None else None,
+        "run_status": run["status"] if run is not None else None,
+        "run_claim_lock": run["claim_lock"] if run is not None else None,
+        "run_claim_expires": run["claim_expires"] if run is not None else None,
+        "run_worker_pid": run["worker_pid"] if run is not None else None,
+        "run_started_at": run["started_at"] if run is not None else None,
+        "run_ended_at": run["ended_at"] if run is not None else None,
+        "prior_runs": prior_runs,
+    }
+
+
+def _completion_evidence_provenance(
+    conn: sqlite3.Connection, task_id: str, metadata: Optional[dict],
+) -> list[dict[str, Any]]:
+    """Resolve declared evidence refs to native attachments and exact hashes."""
+    evidence = metadata.get("production_evidence") if isinstance(metadata, dict) else None
+    refs = evidence.get("refs") if isinstance(evidence, dict) else None
+    if not isinstance(refs, list):
+        return []
+    ids = {
+        int(ref["attachment_id"])
+        for ref in refs
+        if isinstance(ref, dict)
+        and isinstance(ref.get("attachment_id"), int)
+        and not isinstance(ref.get("attachment_id"), bool)
+    }
+    attachment_events: dict[int, dict[str, Any]] = {}
+    for event in conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'attachment_fetched' ORDER BY id",
+        (task_id,),
+    ).fetchall():
+        try:
+            payload = json.loads(event["payload"] or "{}")
+            attachment_id = int(payload.get("attachment_id"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        attachment_events[attachment_id] = {
+            "run_id": int(event["run_id"]) if event["run_id"] is not None else None,
+            "source_url": payload.get("source_url"),
+            "sha256": payload.get("sha256"),
+            "size": payload.get("size"),
+        }
+    resolved: list[dict[str, Any]] = []
+    for attachment_id in sorted(ids):
+        row = conn.execute(
+            "SELECT id, task_id, filename, stored_path, size, uploaded_by, created_at "
+            "FROM task_attachments WHERE id = ? AND task_id = ?",
+            (attachment_id, task_id),
+        ).fetchone()
+        if row is None:
+            continue
+        path = Path(row["stored_path"])
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        try:
+            document = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            document = None
+        event = attachment_events.get(attachment_id, {})
+        resolved.append({
+            "attachment_id": int(row["id"]),
+            "task_id": row["task_id"],
+            "filename": row["filename"],
+            "size": len(data),
+            "recorded_size": int(row["size"]),
+            "uploaded_by": row["uploaded_by"],
+            "created_at": int(row["created_at"]),
+            "run_id": event.get("run_id"),
+            "source_url": event.get("source_url"),
+            "fetched_sha256": event.get("sha256"),
+            "fetched_size": event.get("size"),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "document": document if isinstance(document, dict) else None,
+        })
+    return resolved
 
 
 def _kanban_observer_consumed(event: str) -> bool:
@@ -3812,13 +3974,16 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     return True
 
 
+_WORKFLOW_EXPECTATION_UNSET = object()
+
+
 def set_task_workflow_step(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     workflow_template_id: str,
     current_step_key: str,
-    expected_current_step_key: Optional[str] = None,
+    expected_current_step_key: Any = _WORKFLOW_EXPECTATION_UNSET,
     reason: Optional[str] = None,
 ) -> bool:
     """Persist one typed workflow step on the existing Kanban task.
@@ -3833,9 +3998,10 @@ def set_task_workflow_step(
     step = str(current_step_key or "").strip()
     if not template or not step:
         raise ValueError("workflow_template_id and current_step_key are required")
+    expectation_supplied = expected_current_step_key is not _WORKFLOW_EXPECTATION_UNSET
     expected = (
         str(expected_current_step_key).strip()
-        if expected_current_step_key is not None
+        if expectation_supplied and expected_current_step_key is not None
         else None
     )
     with write_txn(conn):
@@ -3849,7 +4015,7 @@ def set_task_workflow_step(
         if row["status"] == "archived":
             raise RuntimeError(f"cannot set workflow step on archived task {task_id}")
         previous_step = row["current_step_key"]
-        if expected is not None and previous_step != expected:
+        if expectation_supplied and previous_step != expected:
             return False
         conn.execute(
             "UPDATE tasks SET workflow_template_id = ?, current_step_key = ? "
@@ -3868,6 +4034,245 @@ def set_task_workflow_step(
             },
         )
     notify_task_updated(conn, task_id, ("workflow_template_id", "current_step_key"))
+    return True
+
+
+def transition_workflow_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workflow_template_id: str,
+    expected_current_step_key: Optional[str],
+    current_step_key: str,
+    expected_assignee: str,
+    expected_run_id: int,
+    next_assignee: Optional[str] = None,
+    handoff: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Atomically persist a claimed workflow transition and role handoff.
+
+    The active task, claim and run are the authority.  A caller cannot move a
+    step and then separately lose a review/reassignment race: the step, run
+    closure, status, assignee and all handoff events commit together or not at
+    all.  ``expected_current_step_key=None`` is an explicit CAS against SQL
+    NULL, protecting first admission from concurrent workers.
+    """
+    template = str(workflow_template_id or "").strip()
+    step = str(current_step_key or "").strip()
+    expected_profile = _canonical_assignee(expected_assignee)
+    target_profile = (
+        _canonical_assignee(next_assignee) if next_assignee is not None else None
+    )
+    if not template or not step or not expected_profile:
+        raise ValueError("workflow template, step and expected assignee are required")
+    if handoff not in {None, "review", "reassign"}:
+        raise ValueError("handoff must be review, reassign, or None")
+    if handoff is not None and not target_profile:
+        raise ValueError("a handoff requires next_assignee")
+
+    now = int(time.time())
+    changed_fields = ["workflow_template_id", "current_step_key"]
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, claim_lock, claim_expires, current_run_id, "
+            "workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        if row["assignee"] != expected_profile:
+            return False
+        if row["current_run_id"] != int(expected_run_id):
+            return False
+        if row["current_step_key"] != expected_current_step_key:
+            return False
+        if not row["claim_lock"] or (
+            row["claim_expires"] is not None and int(row["claim_expires"]) < now
+        ):
+            return False
+        run = conn.execute(
+            "SELECT profile, status, claim_lock, claim_expires, ended_at "
+            "FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(expected_run_id), task_id),
+        ).fetchone()
+        if (
+            run is None
+            or run["profile"] != expected_profile
+            or run["status"] != "running"
+            or run["ended_at"] is not None
+            or run["claim_lock"] != row["claim_lock"]
+            or (
+                run["claim_expires"] is not None
+                and int(run["claim_expires"]) < now
+            )
+        ):
+            return False
+
+        previous_step = row["current_step_key"]
+        if handoff is None:
+            cur = conn.execute(
+                "UPDATE tasks SET workflow_template_id = ?, current_step_key = ? "
+                "WHERE id = ? AND status = 'running' AND assignee = ? "
+                "AND current_run_id = ? AND claim_lock = ? "
+                + (
+                    "AND current_step_key IS NULL"
+                    if expected_current_step_key is None
+                    else "AND current_step_key = ?"
+                ),
+                (
+                    (template, step, task_id, expected_profile, int(expected_run_id), row["claim_lock"])
+                    if expected_current_step_key is None
+                    else (
+                        template, step, task_id, expected_profile,
+                        int(expected_run_id), row["claim_lock"], expected_current_step_key,
+                    )
+                ),
+            )
+            run_id = int(expected_run_id)
+        else:
+            target_status = "review" if handoff == "review" else "ready"
+            cur = conn.execute(
+                "UPDATE tasks SET workflow_template_id = ?, current_step_key = ?, "
+                "status = ?, assignee = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'running' AND assignee = ? "
+                "AND current_run_id = ? AND claim_lock = ? "
+                + (
+                    "AND current_step_key IS NULL"
+                    if expected_current_step_key is None
+                    else "AND current_step_key = ?"
+                ),
+                (
+                    (
+                        template, step, target_status, target_profile, task_id,
+                        expected_profile, int(expected_run_id), row["claim_lock"],
+                    )
+                    if expected_current_step_key is None
+                    else (
+                        template, step, target_status, target_profile, task_id,
+                        expected_profile, int(expected_run_id), row["claim_lock"],
+                        expected_current_step_key,
+                    )
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome=("review_requested" if handoff == "review" else "handoff"),
+                status=("review" if handoff == "review" else "released"),
+                summary=reason,
+            )
+            changed_fields.extend(("status", "assignee"))
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "workflow_step_changed",
+            {
+                "workflow_template_id": template,
+                "previous_step_key": previous_step,
+                "current_step_key": step,
+                "reason": reason,
+            },
+            run_id=run_id,
+        )
+        if handoff == "review":
+            _append_event(
+                conn,
+                task_id,
+                "review_requested",
+                {
+                    "summary": reason,
+                    "implementer": expected_profile,
+                    "reviewer": target_profile,
+                },
+                run_id=run_id,
+            )
+        elif handoff == "reassign":
+            _append_event(
+                conn,
+                task_id,
+                "assigned",
+                {"assignee": target_profile, "reason": reason},
+                run_id=run_id,
+            )
+    notify_task_updated(conn, task_id, tuple(changed_fields))
+    return True
+
+
+def reroute_ready_task_once(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_assignee: str,
+    next_assignee: str,
+    threshold_seconds: int,
+    marker_kind: str = "delivery_v2_rerouted",
+    now: Optional[int] = None,
+) -> bool:
+    """CAS-reroute one genuinely unclaimed ready assignment exactly once."""
+    expected = _canonical_assignee(expected_assignee)
+    target = _canonical_assignee(next_assignee)
+    if not expected or not target or expected == target:
+        return False
+    timestamp = int(time.time()) if now is None else int(now)
+    threshold = max(0, int(threshold_seconds))
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, claim_lock, current_run_id, created_at "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "ready"
+            or row["assignee"] != expected
+            or row["claim_lock"] is not None
+            or row["current_run_id"] is not None
+        ):
+            return False
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = ? LIMIT 1",
+            (task_id, marker_kind),
+        ).fetchone():
+            return False
+        timing = conn.execute(
+            "SELECT MAX(created_at) AS since_at FROM task_events "
+            "WHERE task_id = ? AND kind IN "
+            "('created','promoted','unblocked','assigned','reclaimed',"
+            "'spawn_failed','crashed','timed_out','review_reopened')",
+            (task_id,),
+        ).fetchone()
+        if timing is None or timing["since_at"] is None:
+            return False
+        since_at = int(timing["since_at"])
+        if timestamp - since_at < threshold:
+            return False
+        cur = conn.execute(
+            "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ? AND status = 'ready' "
+            "AND assignee = ? AND claim_lock IS NULL AND current_run_id IS NULL",
+            (target, task_id, expected),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "assigned", {"assignee": target})
+        _append_event(
+            conn,
+            task_id,
+            marker_kind,
+            {
+                "from": expected,
+                "to": target,
+                "unclaimed_since": since_at,
+                "threshold_seconds": threshold,
+            },
+        )
+    notify_task_updated(conn, task_id, ("assignee",))
     return True
 
 
@@ -4338,13 +4743,108 @@ def add_attachment(
                 now,
             ),
         )
+        attachment_id = int(cur.lastrowid or 0)
         _append_event(
             conn,
             task_id,
             "attached",
-            {"filename": filename.strip(), "size": int(size), "by": uploaded_by},
+            {
+                "attachment_id": attachment_id,
+                "filename": filename.strip(),
+                "size": int(size),
+                "by": uploaded_by,
+            },
         )
-        return int(cur.lastrowid or 0)
+        return attachment_id
+
+
+def store_attachment_from_url(
+    conn: sqlite3.Connection,
+    task_id: str,
+    url: str,
+    filename: str,
+    *,
+    content_type: Optional[str] = None,
+    board: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> tuple[int, int]:
+    """Fetch and attest one URL attachment from the active native worker run.
+
+    Generic byte attachments cannot emit ``attachment_fetched``.  This is the
+    sole operation that does so: it performs the guarded network fetch itself,
+    then revalidates the task/run/claim/profile/PID before recording the
+    fetched-source event used by Delivery V2 production evidence.
+    """
+    from tools.kanban_tools import _download_url_with_cap
+
+    if max_bytes is None:
+        max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
+    data, fetched_type, source_url = _download_url_with_cap(url, max_bytes)
+    task = get_task(conn, task_id)
+    provenance = _active_completion_run_provenance(conn, task) if task else {}
+    now = int(time.time())
+    run_id = provenance.get("run_id")
+    profile = provenance.get("run_profile")
+    if (
+        task is None
+        or task.status != "running"
+        or provenance.get("worker_task_id") != task_id
+        or provenance.get("worker_run_id") != run_id
+        or provenance.get("task_current_run_id") != run_id
+        or not profile
+        or profile != provenance.get("process_profile")
+        or profile != task.assignee
+        or provenance.get("run_status") != "running"
+        or provenance.get("run_ended_at") is not None
+        or not provenance.get("task_claim_lock")
+        or provenance.get("task_claim_lock") != provenance.get("run_claim_lock")
+        or not isinstance(provenance.get("task_claim_expires"), int)
+        or provenance.get("task_claim_expires") <= now
+        or provenance.get("task_claim_expires") != provenance.get("run_claim_expires")
+        or provenance.get("task_worker_pid") != provenance.get("process_pid")
+        or provenance.get("run_worker_pid") != provenance.get("process_pid")
+    ):
+        raise RuntimeError("URL attachment requires this task's active claimed worker run")
+    attachment_id = store_attachment_bytes(
+        conn,
+        task_id,
+        filename,
+        data,
+        content_type=content_type or fetched_type,
+        uploaded_by=profile,
+        board=board,
+        max_bytes=max_bytes,
+    )
+    with write_txn(conn):
+        current = get_task(conn, task_id)
+        current_provenance = (
+            _active_completion_run_provenance(conn, current) if current else {}
+        )
+        if (
+            current is None
+            or current.current_run_id != run_id
+            or current.claim_lock != provenance.get("task_claim_lock")
+            or current.claim_expires != provenance.get("task_claim_expires")
+            or current.worker_pid != provenance.get("task_worker_pid")
+            or current_provenance.get("run_profile") != profile
+            or current_provenance.get("worker_run_id") != run_id
+            or current.claim_expires is None
+            or int(current.claim_expires) <= int(time.time())
+        ):
+            raise RuntimeError("URL attachment claim changed before provenance commit")
+        _append_event(
+            conn,
+            task_id,
+            "attachment_fetched",
+            {
+                "attachment_id": attachment_id,
+                "source_url": source_url,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+            },
+            run_id=run_id,
+        )
+    return attachment_id, len(data)
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
@@ -5563,24 +6063,6 @@ def complete_task(
     else:
         verified_cards = []
 
-    veto_reason = _before_kanban_task_complete(
-        conn,
-        task_id,
-        actor=completion_actor,
-        summary=summary,
-        result=result,
-        metadata=metadata,
-    )
-    if veto_reason is not None:
-        with write_txn(conn):
-            _append_event(
-                conn,
-                task_id,
-                "completion_blocked_policy",
-                {"actor": completion_actor, "reason": veto_reason[:400]},
-            )
-        return False
-
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -5590,12 +6072,41 @@ def complete_task(
         # ``review`` or ``running``.
         if not _parents_satisfied(conn, task_id):
             return False
-        prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        prior_status = prior["status"] if prior else None
-        if expected_run_id is None:
+        prior_task = get_task(conn, task_id)
+        if prior_task is None or prior_task.status not in {
+            "running", "ready", "blocked", "review",
+        }:
+            return False
+        if (
+            expected_run_id is not None
+            and prior_task.current_run_id != int(expected_run_id)
+        ):
+            return False
+        run_provenance = _active_completion_run_provenance(conn, prior_task)
+        evidence_provenance = _completion_evidence_provenance(conn, task_id, metadata)
+        veto_reason, terminal_step = _before_kanban_task_complete(
+            conn,
+            task_id,
+            actor=completion_actor,
+            summary=summary,
+            result=result,
+            metadata=metadata,
+            task_snapshot=prior_task,
+            run_provenance=run_provenance,
+            evidence_provenance=evidence_provenance,
+        )
+        if veto_reason is not None:
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_policy",
+                {"actor": completion_actor, "reason": veto_reason[:400]},
+                run_id=prior_task.current_run_id,
+            )
+            return False
+        next_step = terminal_step or prior_task.current_step_key
+        if terminal_step is not None:
+            commit_now = int(time.time())
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5606,32 +6117,81 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       current_step_key = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status = ?
+                   AND assignee IS ?
+                   AND current_run_id IS ?
+                   AND claim_lock IS ?
+                   AND claim_expires IS ?
+                   AND claim_expires >= ?
+                   AND worker_pid IS ?
+                   AND current_step_key IS ?
+                   AND EXISTS (
+                       SELECT 1 FROM task_runs r
+                        WHERE r.id = tasks.current_run_id
+                          AND r.task_id = tasks.id
+                          AND r.profile IS tasks.assignee
+                          AND r.status = 'running'
+                          AND r.ended_at IS NULL
+                          AND r.claim_lock IS tasks.claim_lock
+                          AND r.claim_expires IS tasks.claim_expires
+                          AND r.claim_expires >= ?
+                          AND r.worker_pid IS tasks.worker_pid
+                   )
                 """,
-                (result, now, task_id),
+                (
+                    result,
+                    now,
+                    next_step,
+                    task_id,
+                    prior_task.status,
+                    prior_task.assignee,
+                    prior_task.current_run_id,
+                    prior_task.claim_lock,
+                    prior_task.claim_expires,
+                    commit_now,
+                    prior_task.worker_pid,
+                    prior_task.current_step_key,
+                    commit_now,
+                ),
             )
         else:
             cur = conn.execute(
                 """
-                UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
-                   AND current_run_id = ?
+            UPDATE tasks
+               SET status       = 'done',
+                   result       = ?,
+                   completed_at = ?,
+                   claim_lock   = NULL,
+                   claim_expires= NULL,
+                   worker_pid   = NULL,
+                   block_kind   = NULL,
+                   block_recurrences = 0,
+                   current_step_key = ?
+             WHERE id = ?
+               AND status = ?
+               AND assignee IS ?
+               AND current_run_id IS ?
+               AND claim_lock IS ?
+               AND current_step_key IS ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (
+                    result,
+                    now,
+                    next_step,
+                    task_id,
+                    prior_task.status,
+                    prior_task.assignee,
+                    prior_task.current_run_id,
+                    prior_task.claim_lock,
+                    prior_task.current_step_key,
+                ),
             )
         if cur.rowcount != 1:
             return False
+        prior_status = prior_task.status
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -5705,6 +6265,19 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        if terminal_step is not None:
+            _append_event(
+                conn,
+                task_id,
+                "workflow_step_changed",
+                {
+                    "workflow_template_id": prior_task.workflow_template_id,
+                    "previous_step_key": prior_task.current_step_key,
+                    "current_step_key": terminal_step,
+                    "reason": "native_completion_policy",
+                },
+                run_id=run_id,
+            )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
