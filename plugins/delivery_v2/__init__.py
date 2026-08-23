@@ -578,6 +578,8 @@ def before_kanban_task_complete(
         if (
             actual is None
             or actual.get("sha256") != ref.get("sha256")
+            or actual.get("fetched_sha256") != actual.get("sha256")
+            or actual.get("fetched_size") != actual.get("size")
             or actual.get("recorded_size") != actual.get("size")
             or _identity(actual.get("uploaded_by")) != verifier
             or actual.get("run_id") != provenance.get("run_id")

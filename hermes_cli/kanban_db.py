@@ -409,6 +409,8 @@ def _completion_evidence_provenance(
         attachment_events[attachment_id] = {
             "run_id": int(event["run_id"]) if event["run_id"] is not None else None,
             "source_url": payload.get("source_url"),
+            "sha256": payload.get("sha256"),
+            "size": payload.get("size"),
         }
     resolved: list[dict[str, Any]] = []
     for attachment_id in sorted(ids):
@@ -439,6 +441,8 @@ def _completion_evidence_provenance(
             "created_at": int(row["created_at"]),
             "run_id": event.get("run_id"),
             "source_url": event.get("source_url"),
+            "fetched_sha256": event.get("sha256"),
+            "fetched_size": event.get("size"),
             "sha256": hashlib.sha256(data).hexdigest(),
             "document": document if isinstance(document, dict) else None,
         })
@@ -4836,6 +4840,7 @@ def store_attachment_from_url(
                 "attachment_id": attachment_id,
                 "source_url": source_url,
                 "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
             },
             run_id=run_id,
         )

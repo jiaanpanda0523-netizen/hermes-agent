@@ -1139,6 +1139,63 @@ def test_hashed_local_self_report_without_fetched_source_is_rejected(
         manager._hooks = saved
 
 
+def test_native_fetched_evidence_rejects_post_fetch_file_tamper(
+    kanban_home, monkeypatch,
+):
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="post-fetch evidence tamper", body=_production_card_body(),
+                assignee="implementer",
+            )
+            assert kb.set_task_workflow_step(
+                conn, task_id, workflow_template_id="anveros-delivery-v2",
+                current_step_key="PRODUCTION_VERIFY",
+            )
+            assert kb.claim_task(conn, task_id, claimer="implementer") is not None
+            assert kb.request_review(
+                conn, task_id, reviewer="verifier",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            )
+            assert kb.claim_review_task(conn, task_id, claimer="verifier") is not None
+            verifier_run_id = kb.get_task(conn, task_id).current_run_id
+            monkeypatch.setenv("HERMES_PROFILE", "verifier")
+            monkeypatch.setenv("HERMES_SESSION_ID", "session-verifier-1")
+            monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(verifier_run_id))
+            metadata = _valid_structured_production_evidence(
+                conn, task_id, verifier_run_id, monkeypatch,
+            )
+            merge_ref = metadata["production_evidence"]["refs"][0]
+            attachment = kb.get_attachment(conn, merge_ref["attachment_id"])
+            path = Path(attachment.stored_path)
+            original = path.read_bytes()
+            tampered = original.replace(
+                b"2026-08-23T00:00:00Z", b"2026-08-24T00:00:00Z",
+            )
+            assert len(tampered) == len(original) and tampered != original
+            path.write_bytes(tampered)
+            merge_ref["sha256"] = hashlib.sha256(tampered).hexdigest()
+            assert kb.complete_task(
+                conn, task_id, actor="verifier", summary="tampered after fetch",
+                metadata=metadata, expected_run_id=verifier_run_id,
+            ) is False
+            event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'completion_blocked_policy' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            assert "PRODUCTION_EVIDENCE_ATTACHMENT_UNVERIFIED" in json.loads(
+                event["payload"]
+            )["reason"]
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+
 @pytest.mark.parametrize(
     ("evidence_options", "expected_reason"),
     [
