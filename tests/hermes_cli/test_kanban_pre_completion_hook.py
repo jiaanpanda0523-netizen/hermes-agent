@@ -225,6 +225,34 @@ def test_delivery_v2_plugin_keeps_nonproduction_completion_normal(kanban_home):
         manager._hooks = saved
 
 
+def test_delivery_v2_strict_cutover_requires_new_task_classification(
+    kanban_home, monkeypatch,
+):
+    import plugins.delivery_v2 as policy
+
+    manager, saved = _install_delivery_v2_policy()
+    monkeypatch.setattr(policy, "_STRICT_AFTER_EPOCH", 1)
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(conn, title="unclassified post-cutover card")
+            assert kb.complete_task(
+                conn, task_id, actor="researcher", summary="must classify",
+            ) is False
+            assert kb.get_task(conn, task_id).status == "ready"
+            event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'completion_blocked_policy' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+    assert "TASK_CLASSIFICATION_REQUIRED" in json.loads(event["payload"])["reason"]
+
+
 def test_delivery_v2_plugin_rejects_negative_delivery_controls(kanban_home):
     """#701-shaped evidence cannot be promoted by activity or a preview."""
     manager, saved = _install_delivery_v2_policy()
