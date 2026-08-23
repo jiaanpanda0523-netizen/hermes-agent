@@ -292,6 +292,49 @@ def on_kanban_dispatch_tick(*, board: str | None = None, **_: Any) -> None:
         conn.close()
 
 
+def on_kanban_task_blocked(
+    *, task_id: str, board: str | None = None, assignee: str | None = None,
+    **_: Any,
+) -> None:
+    """Escalate a verifier BLOCK to the existing platform-fixer profile.
+
+    The native block transition remains authoritative and local to this card.
+    This observer only changes its durable assignee, preventing dependency
+    promotion from sending an unchanged review straight back to the verifier.
+    """
+    if not task_id:
+        return
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board=board)
+    try:
+        task = kb.get_task(conn, task_id)
+        contract = _contract(task) if task is not None else None
+        if contract is None:
+            return
+        state = _workflow_state(task, contract)
+        if state not in {"PRODUCT_REVIEW", "HEAD_FROZEN", "PRODUCTION_VERIFY"}:
+            return
+        profiles = _role_profiles(contract)
+        verifier_profiles = {
+            profiles.get("PRODUCT_VERIFIER", ""),
+            profiles.get("PRODUCTION_VERIFIER", ""),
+        }
+        blocked_by = _identity(assignee or getattr(task, "assignee", None))
+        fixer = profiles.get("PLATFORM_FIXER", "")
+        if not fixer or blocked_by not in verifier_profiles or fixer == blocked_by:
+            return
+        kb.reassign_task(
+            conn,
+            task_id,
+            fixer,
+            reclaim_first=getattr(task, "status", None) == "running",
+            reason=f"delivery_v2_verifier_block:{state}",
+        )
+    finally:
+        conn.close()
+
+
 def before_kanban_task_complete(
     *, task: Any, actor: str, metadata: Any, **_: Any,
 ) -> dict[str, Any] | None:
@@ -409,6 +452,7 @@ def register(ctx) -> None:
     )
     ctx.register_hook("before_kanban_task_complete", before_kanban_task_complete)
     ctx.register_hook("on_kanban_dispatch_tick", on_kanban_dispatch_tick)
+    ctx.register_hook("kanban_task_blocked", on_kanban_task_blocked)
     ctx.register_hook("kanban_task_completed", on_kanban_task_completed)
     ctx.register_tool(
         name="delivery_v2_transition",
