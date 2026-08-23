@@ -36,6 +36,7 @@ _REQUIRED_DELIVERY_CONTROLS = (
 )
 _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 WORKFLOW_TEMPLATE = "anveros-delivery-v2"
+_STRICT_AFTER_EPOCH: int | None = None
 _STATES = (
     "TRIAGE", "READY", "IMPLEMENTING", "PREVIEW_READY", "PRODUCT_REVIEW",
     "HEAD_FROZEN", "MERGE_QUEUED", "MERGED", "DEPLOYING",
@@ -294,9 +295,16 @@ def on_kanban_dispatch_tick(*, board: str | None = None, **_: Any) -> None:
 def before_kanban_task_complete(
     *, task: Any, actor: str, metadata: Any, **_: Any,
 ) -> dict[str, Any] | None:
-    """Allow legacy cards; fail closed for explicitly enrolled V2 cards."""
+    """Grandfather pre-cutover cards; fail closed for every newer task."""
     contract = _contract(task)
     if contract is None:
+        created_at = getattr(task, "created_at", None)
+        if (
+            _STRICT_AFTER_EPOCH is not None
+            and isinstance(created_at, int)
+            and created_at >= _STRICT_AFTER_EPOCH
+        ):
+            return _decision(["TASK_CLASSIFICATION_REQUIRED"])
         return None
     issues: list[str] = []
     classification = contract.get("classification")
@@ -392,6 +400,13 @@ def _decision(issues: list[str]) -> dict[str, Any]:
 
 def register(ctx) -> None:
     """Register policy on existing Hermes hook and tool surfaces only."""
+    global _STRICT_AFTER_EPOCH
+    strict_after = ctx.get_config("strict_after_epoch")
+    _STRICT_AFTER_EPOCH = (
+        strict_after
+        if isinstance(strict_after, int) and not isinstance(strict_after, bool)
+        else None
+    )
     ctx.register_hook("before_kanban_task_complete", before_kanban_task_complete)
     ctx.register_hook("on_kanban_dispatch_tick", on_kanban_dispatch_tick)
     ctx.register_hook("kanban_task_completed", on_kanban_task_completed)
