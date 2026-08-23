@@ -194,6 +194,7 @@ def _valid_structured_production_evidence(
     *,
     merged_at="2026-08-23T00:00:00Z",
     observed_origin="https://delivery.example.com",
+    verifier_session_id="session-verifier-1",
 ):
     from tools import kanban_tools
 
@@ -279,7 +280,7 @@ def _valid_structured_production_evidence(
         "PRODUCT_PLATFORM_PR_SEPARATION": "PASS",
         "HEAD_FROZEN": "PASS",
         "verifier_run_id": verifier_run_id,
-        "verifier_session_id": "session-verifier-1",
+        "verifier_session_id": verifier_session_id,
         "implementer_run_id": implementer_run_id,
         "refs": refs,
     }
@@ -324,6 +325,69 @@ def test_delivery_v2_plugin_blocks_then_allows_independent_receipt(
             ) is True
             assert kb.get_task(conn, task_id).status == "done"
             assert kb.get_task(conn, task_id).current_step_key == "DONE"
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved
+
+
+def test_transient_production_verifier_fallback_keeps_structural_provenance(
+    kanban_home, monkeypatch,
+):
+    from plugins.delivery_v2 import on_kanban_task_blocked
+
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        body = json.loads(_production_card_body())
+        body["delivery_v2"].update({
+            "platform_fixer": "ops",
+            "fallback_profiles": {"verifier": "ops"},
+        })
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="production verifier provider fallback",
+                body=json.dumps(body), assignee="implementer",
+            )
+            assert kb.set_task_workflow_step(
+                conn, task_id, workflow_template_id="anveros-delivery-v2",
+                current_step_key="PRODUCTION_VERIFY",
+            )
+            assert kb.claim_task(conn, task_id, claimer="implementer") is not None
+            assert kb.request_review(
+                conn, task_id, reviewer="verifier",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            )
+            assert kb.claim_review_task(conn, task_id, claimer="verifier") is not None
+            assert kb.block_task(
+                conn, task_id, reason="provider unavailable", kind="transient",
+            )
+        finally:
+            conn.close()
+
+        on_kanban_task_blocked(
+            task_id=task_id, board="default", assignee="verifier",
+            reason="provider unavailable",
+        )
+        conn = kb.connect()
+        try:
+            assert kb.claim_review_task(conn, task_id, claimer="ops") is not None
+            fallback_run_id = kb.get_task(conn, task_id).current_run_id
+            monkeypatch.setenv("HERMES_PROFILE", "ops")
+            monkeypatch.setenv("HERMES_SESSION_ID", "session-ops-1")
+            monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+            monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(fallback_run_id))
+            metadata = _valid_structured_production_evidence(
+                conn, task_id, fallback_run_id, monkeypatch,
+                verifier_session_id="session-ops-1",
+            )
+            assert kb.complete_task(
+                conn, task_id, actor="ops", summary="fallback verified",
+                metadata=metadata, expected_run_id=fallback_run_id,
+            ) is True
+            task = kb.get_task(conn, task_id)
+            assert task.status == "done"
+            assert task.current_step_key == "DONE"
         finally:
             conn.close()
     finally:
@@ -667,6 +731,154 @@ def test_phase_b_transient_verifier_block_resumes_same_card_with_fixer(kanban_ho
             ).fetchall()
         ]
         assert kinds[-3:] == ["blocked", "assigned", "unblocked"]
+    finally:
+        conn.close()
+
+
+def test_phase_b_transient_fallback_can_own_the_blocked_verifier_transition(
+    kanban_home, monkeypatch,
+):
+    from plugins.delivery_v2 import on_kanban_task_blocked, transition_delivery_state
+
+    body = json.loads(_phase_b_card_body())
+    body["delivery_v2"]["fallback_profiles"]["verifier"] = "ops"
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="transient verifier role fallback", body=json.dumps(body),
+            assignee="coder",
+        )
+        assert kb.set_task_workflow_step(
+            conn, task_id, workflow_template_id="anveros-delivery-v2",
+            current_step_key="PRODUCT_REVIEW",
+        )
+        assert kb.claim_task(conn, task_id, claimer="coder") is not None
+        assert kb.request_review(
+            conn, task_id, reviewer="verifier",
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
+        )
+        assert kb.claim_review_task(conn, task_id, claimer="verifier") is not None
+        assert kb.block_task(
+            conn, task_id, reason="provider unavailable", kind="transient",
+        )
+    finally:
+        conn.close()
+
+    on_kanban_task_blocked(
+        task_id=task_id, board="default", assignee="verifier",
+        reason="provider unavailable",
+    )
+    conn = kb.connect()
+    try:
+        assert kb.claim_review_task(conn, task_id, claimer="ops") is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_PROFILE", "ops")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    result = transition_delivery_state({
+        "task_id": task_id, "next_state": "HEAD_FROZEN",
+    })
+    assert "PRODUCT_REVIEW -> HEAD_FROZEN" in result
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task.current_step_key == "HEAD_FROZEN"
+        assert task.assignee == "ops"
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_task_body_fallback_mapping_alone_cannot_delegate_verifier_role(
+    kanban_home, monkeypatch,
+):
+    from plugins.delivery_v2 import transition_delivery_state
+
+    body = json.loads(_phase_b_card_body())
+    body["delivery_v2"]["fallback_profiles"]["verifier"] = "ops"
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="unproven fallback mapping", body=json.dumps(body),
+            assignee="ops",
+        )
+        assert kb.set_task_workflow_step(
+            conn, task_id, workflow_template_id="anveros-delivery-v2",
+            current_step_key="PRODUCT_REVIEW",
+        )
+        assert kb.claim_task(conn, task_id, claimer="ops") is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_PROFILE", "ops")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    result = transition_delivery_state({
+        "task_id": task_id, "next_state": "HEAD_FROZEN",
+    })
+    assert result == "Error: trusted active run provenance does not own this transition."
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).current_step_key == "PRODUCT_REVIEW"
+    finally:
+        conn.close()
+
+
+def test_capability_escalation_does_not_delegate_product_verifier_role(
+    kanban_home, monkeypatch,
+):
+    from plugins.delivery_v2 import on_kanban_task_blocked, transition_delivery_state
+
+    body = json.loads(_phase_b_card_body())
+    body["delivery_v2"]["fallback_profiles"]["verifier"] = "ops"
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="capability block is not verifier delegation",
+            body=json.dumps(body), assignee="coder",
+        )
+        assert kb.set_task_workflow_step(
+            conn, task_id, workflow_template_id="anveros-delivery-v2",
+            current_step_key="PRODUCT_REVIEW",
+        )
+        assert kb.claim_task(conn, task_id, claimer="coder") is not None
+        assert kb.request_review(
+            conn, task_id, reviewer="verifier",
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
+        )
+        assert kb.claim_review_task(conn, task_id, claimer="verifier") is not None
+        assert kb.block_task(
+            conn, task_id, reason="product defect", kind="capability",
+        )
+    finally:
+        conn.close()
+
+    on_kanban_task_blocked(
+        task_id=task_id, board="default", assignee="verifier",
+        reason="product defect",
+    )
+    conn = kb.connect()
+    try:
+        assert kb.unblock_task(conn, task_id)
+        assert kb.claim_review_task(conn, task_id, claimer="ops") is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_PROFILE", "ops")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    result = transition_delivery_state({
+        "task_id": task_id, "next_state": "HEAD_FROZEN",
+    })
+    assert result == "Error: trusted active run provenance does not own this transition."
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).current_step_key == "PRODUCT_REVIEW"
     finally:
         conn.close()
 

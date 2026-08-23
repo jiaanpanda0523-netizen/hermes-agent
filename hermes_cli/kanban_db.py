@@ -332,8 +332,27 @@ def _active_completion_run_provenance(
             "WHERE id = ? AND task_id = ?",
             (int(task.current_run_id), task.id),
         ).fetchone()
-    prior_runs = [
-        {
+    prior_runs = []
+    prior_run_rows = conn.execute(
+        "SELECT r.id, r.profile, r.status, r.outcome, r.started_at, r.ended_at, "
+        "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+        "AND e.run_id = r.id AND e.kind = 'claimed') AS claimed_event, "
+        "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
+        "AND e.run_id = r.id AND e.kind = 'review_requested') "
+        "AS review_requested_event, "
+        "(SELECT e.payload FROM task_events e WHERE e.task_id = r.task_id "
+        "AND e.run_id = r.id AND e.kind = 'blocked' "
+        "ORDER BY e.id DESC LIMIT 1) AS blocked_event_payload "
+        "FROM task_runs r WHERE r.task_id = ? "
+        "AND r.ended_at IS NOT NULL AND r.profile IS NOT NULL ORDER BY r.id",
+        (task.id,),
+    ).fetchall()
+    for row in prior_run_rows:
+        try:
+            blocked_payload = json.loads(row["blocked_event_payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            blocked_payload = {}
+        prior_runs.append({
             "run_id": int(row["id"]),
             "profile": row["profile"],
             "status": row["status"],
@@ -342,18 +361,8 @@ def _active_completion_run_provenance(
             "ended_at": int(row["ended_at"]),
             "claimed_event": bool(row["claimed_event"]),
             "review_requested_event": bool(row["review_requested_event"]),
-        }
-        for row in conn.execute(
-            "SELECT r.id, r.profile, r.status, r.outcome, r.started_at, r.ended_at, "
-            "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
-            "AND e.run_id = r.id AND e.kind = 'claimed') AS claimed_event, "
-            "EXISTS(SELECT 1 FROM task_events e WHERE e.task_id = r.task_id "
-            "AND e.run_id = r.id AND e.kind = 'review_requested') "
-            "AS review_requested_event FROM task_runs r WHERE r.task_id = ? "
-            "AND r.ended_at IS NOT NULL AND r.profile IS NOT NULL",
-            (task.id,),
-        ).fetchall()
-    ]
+            "block_kind": blocked_payload.get("kind"),
+        })
     return {
         "task_id": task.id,
         "task_assignee": task.assignee,
@@ -378,6 +387,11 @@ def _active_completion_run_provenance(
         "run_ended_at": run["ended_at"] if run is not None else None,
         "prior_runs": prior_runs,
     }
+
+
+def active_run_provenance(conn: sqlite3.Connection, task: Task) -> dict[str, Any]:
+    """Return the native current/prior run packet exposed to policy plugins."""
+    return _active_completion_run_provenance(conn, task)
 
 
 def _completion_evidence_provenance(
