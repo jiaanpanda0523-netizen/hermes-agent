@@ -301,6 +301,33 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_resume_display_includes_compacted_rows_but_model_history_stays_live(self, db):
+        """Provider/model switching must not hide the compacted UI transcript."""
+        db.create_session(session_id="s1", source="tui")
+        db.append_message("s1", role="user", content="old request")
+        db.append_message("s1", role="assistant", content="old result")
+        db.append_message("s1", role="user", content="current request")
+        db.append_message("s1", role="assistant", content="current result")
+        db._conn.execute(
+            "UPDATE messages SET active=0, compacted=1 "
+            "WHERE session_id=? AND content IN (?, ?)",
+            ("s1", "old request", "old result"),
+        )
+        db._conn.commit()
+
+        model_history, display_history = db.get_resume_conversations("s1")
+
+        assert [m["content"] for m in model_history] == [
+            "current request",
+            "current result",
+        ]
+        assert [m["content"] for m in display_history] == [
+            "old request",
+            "old result",
+            "current request",
+            "current result",
+        ]
+
 
     def test_branch_resume_does_not_include_parent_messages_added_after_fork(self, db):
         """A branch owns its copied transcript, not the parent's later turns."""

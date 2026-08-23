@@ -11251,8 +11251,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                f"SELECT session_id, active, compacted, {self._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) "
+                # Compacted rows are the durable UI lineage; rewound rows
+                # (active=0, compacted=0) remain intentionally hidden.
+                "AND (active = 1 OR compacted = 1) "
                 # ORDER BY id (insertion order) — see get_messages_as_conversation
                 # for why timestamp ordering is unsafe.
                 "ORDER BY id",
@@ -11262,7 +11265,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Tip rows are exactly the model-fed set (get_messages_as_conversation
         # with session_ids=[session_id]); filtering the lineage fetch preserves
         # their relative id order.
-        tip_rows = [r for r in rows if r["session_id"] == session_id]
+        tip_rows = [
+            r for r in rows
+            if r["session_id"] == session_id and r["active"] == 1
+        ]
         model_history = self._rows_to_conversation(
             tip_rows,
             session_id=session_id,
