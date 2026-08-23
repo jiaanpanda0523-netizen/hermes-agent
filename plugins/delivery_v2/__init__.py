@@ -99,23 +99,39 @@ def _url_is_production_https(value: Any) -> bool:
 
 
 def _authoritative_evidence_source(
-    kind: str, source_url: Any, production_url: Any, exact_sha: Any,
+    kind: str,
+    source_url: Any,
+    production_url: Any,
+    exact_sha: Any,
+    contract: Mapping[str, Any],
 ) -> bool:
     if not _url_is_production_https(source_url):
         return False
     source = urlparse(source_url)
-    if kind in {"merge", "rollback"}:
+    repository = str(contract.get("repository") or "").strip().casefold()
+    if kind == "merge":
+        pull_request = contract.get("pull_request_number")
         return (
             (source.hostname or "").casefold() == "api.github.com"
-            and re.fullmatch(
-                rf"/repos/[^/]+/[^/]+/commits/{re.escape(str(exact_sha))}",
-                source.path.rstrip("/"),
-            ) is not None
+            and isinstance(pull_request, int)
+            and not isinstance(pull_request, bool)
+            and source.path.rstrip("/").casefold()
+            == f"/repos/{repository}/pulls/{pull_request}"
+        )
+    if kind == "rollback":
+        return (
+            (source.hostname or "").casefold() == "api.github.com"
+            and source.path.rstrip("/").casefold()
+            == f"/repos/{repository}/commits/{str(exact_sha).casefold()}"
         )
     production = urlparse(str(production_url or ""))
+    enrolled = urlparse(str(contract.get("production_origin") or ""))
     return (
         (source.hostname or "").casefold()
         == (production.hostname or "").casefold()
+        == (enrolled.hostname or "").casefold()
+        and source.scheme == production.scheme == enrolled.scheme == "https"
+        and source.port == production.port == enrolled.port
     )
 
 
@@ -441,6 +457,28 @@ def before_kanban_task_complete(
         issues.append("EXACT_SHA_MATCH_FAILED")
     if not _url_is_production_https(evidence.get("production_url")):
         issues.append("PRODUCTION_URL_INVALID")
+    production_origin = str(contract.get("production_origin") or "").rstrip("/")
+    production_url = str(evidence.get("production_url") or "")
+    parsed_production = urlparse(production_url)
+    parsed_origin = urlparse(production_origin)
+    if (
+        not _url_is_production_https(production_origin)
+        or parsed_production.scheme != parsed_origin.scheme
+        or parsed_production.hostname != parsed_origin.hostname
+        or parsed_production.port != parsed_origin.port
+    ):
+        issues.append("PRODUCTION_ORIGIN_MISMATCH")
+    repository = str(contract.get("repository") or "").strip().casefold()
+    production_branch = str(contract.get("production_branch") or "").strip()
+    pull_request_number = contract.get("pull_request_number")
+    if (
+        re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", repository) is None
+        or not production_branch
+        or not isinstance(pull_request_number, int)
+        or isinstance(pull_request_number, bool)
+        or pull_request_number < 1
+    ):
+        issues.append("DURABLE_RELEASE_TARGET_REQUIRED")
     if evidence.get("deployment_status") != "SUCCESS":
         issues.append("DEPLOYMENT_STATUS_SUCCESS_REQUIRED")
     if evidence.get("acceptance_status") != "PASS":
@@ -545,7 +583,11 @@ def before_kanban_task_complete(
             or actual.get("run_id") != provenance.get("run_id")
             or actual.get("source_url") != source_ref
             or not _authoritative_evidence_source(
-                kind, source_ref, evidence.get("production_url"), expected_sha,
+                kind,
+                source_ref,
+                evidence.get("production_url"),
+                expected_sha,
+                contract,
             )
             or not isinstance(actual.get("created_at"), int)
             or actual.get("created_at") < provenance.get("run_started_at", 0)
@@ -555,8 +597,17 @@ def before_kanban_task_complete(
         else:
             document = actual.get("document")
             document = document if isinstance(document, Mapping) else {}
-        if kind in {"merge", "rollback"} and document.get("sha") != expected_sha:
-            issues.append("GITHUB_COMMIT_EVIDENCE_INVALID")
+        if kind == "merge" and (
+            not _identity(document.get("merged_at"))
+            or document.get("merge_commit_sha") != expected_sha
+            or document.get("base", {}).get("ref") != production_branch
+            or _identity(document.get("base", {}).get("repo", {}).get("full_name"))
+            != repository
+            or document.get("number") != pull_request_number
+        ):
+            issues.append("GITHUB_MERGE_EVIDENCE_INVALID")
+        if kind == "rollback" and document.get("sha") != expected_sha:
+            issues.append("GITHUB_ROLLBACK_COMMIT_EVIDENCE_INVALID")
         if kind == "deployment" and (
             document.get("deployed_sha") != expected_sha
             or document.get("deployment_status") != "SUCCESS"

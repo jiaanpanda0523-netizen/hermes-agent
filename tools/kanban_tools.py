@@ -212,44 +212,6 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
-def _active_attachment_run(kb, conn, task_id: str) -> Optional[tuple[str, int]]:
-    """Derive attachment identity from this dispatcher worker's live claim."""
-    import time as _time
-
-    run_id = _worker_run_id(task_id)
-    profile = (os.environ.get("HERMES_PROFILE") or "").strip().casefold()
-    task = kb.get_task(conn, task_id)
-    if (
-        run_id is None
-        or not profile
-        or task is None
-        or task.status != "running"
-        or task.assignee != profile
-        or task.current_run_id != run_id
-        or not task.claim_lock
-        or task.claim_expires is None
-        or int(task.claim_expires) < int(_time.time())
-        or task.worker_pid != os.getpid()
-    ):
-        return None
-    run = conn.execute(
-        "SELECT profile, status, claim_lock, claim_expires, worker_pid, ended_at "
-        "FROM task_runs WHERE id = ? AND task_id = ?",
-        (run_id, task_id),
-    ).fetchone()
-    if (
-        run is None
-        or run["profile"] != profile
-        or run["status"] != "running"
-        or run["ended_at"] is not None
-        or run["claim_lock"] != task.claim_lock
-        or run["claim_expires"] != task.claim_expires
-        or run["worker_pid"] != os.getpid()
-    ):
-        return None
-    return profile, run_id
-
-
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -1192,16 +1154,13 @@ def _handle_attach(args: dict, **kw) -> str:
     try:
         _, conn = _connect(board=board)
         try:
-            provenance = _active_attachment_run(kb, conn, tid)
-            uploader, run_id = provenance or ("agent", None)
             att_id = kb.store_attachment_bytes(
                 conn,
                 tid,
                 str(filename),
                 data,
                 content_type=content_type,
-                uploaded_by=uploader,
-                run_id=run_id,
+                uploaded_by="agent",
                 board=board,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
@@ -1315,31 +1274,32 @@ def _handle_attach_url(args: dict, **kw) -> str:
     content_type = args.get("content_type")
     board = args.get("board")
     try:
-        data, fetched_ct, source_url = _download_url_with_cap(
-            url, kb.KANBAN_ATTACHMENT_MAX_BYTES,
-        )
-    except ValueError as e:
-        return tool_error(f"kanban_attach_url: {e}")
-    except Exception as e:
-        logger.exception("kanban_attach_url download failed")
-        return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
-    try:
         _, conn = _connect(board=board)
         try:
-            provenance = _active_attachment_run(kb, conn, tid)
-            uploader, run_id = provenance or ("agent", None)
-            att_id = kb.store_attachment_bytes(
-                conn,
-                tid,
-                str(filename),
-                data,
-                content_type=content_type or fetched_ct,
-                uploaded_by=uploader,
-                run_id=run_id,
-                source_url=source_url,
-                board=board,
-            )
-            return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+            if _worker_run_id(tid) is None:
+                data, fetched_type, _ = _download_url_with_cap(
+                    url, kb.KANBAN_ATTACHMENT_MAX_BYTES,
+                )
+                att_id = kb.store_attachment_bytes(
+                    conn,
+                    tid,
+                    str(filename),
+                    data,
+                    content_type=content_type or fetched_type,
+                    uploaded_by="agent",
+                    board=board,
+                )
+                size = len(data)
+            else:
+                att_id, size = kb.store_attachment_from_url(
+                    conn,
+                    tid,
+                    url,
+                    str(filename),
+                    content_type=content_type,
+                    board=board,
+                )
+            return _ok(task_id=tid, attachment_id=att_id, size=size)
         finally:
             conn.close()
     except kb.AttachmentTooLarge as e:

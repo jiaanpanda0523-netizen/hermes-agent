@@ -398,7 +398,7 @@ def _completion_evidence_provenance(
     attachment_events: dict[int, dict[str, Any]] = {}
     for event in conn.execute(
         "SELECT run_id, payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'attached' ORDER BY id",
+        "AND kind = 'attachment_fetched' ORDER BY id",
         (task_id,),
     ).fetchall():
         try:
@@ -4648,8 +4648,6 @@ def store_attachment_bytes(
     *,
     content_type: Optional[str] = None,
     uploaded_by: Optional[str] = None,
-    run_id: Optional[int] = None,
-    source_url: Optional[str] = None,
     board: Optional[str] = None,
     max_bytes: Optional[int] = None,
 ) -> int:
@@ -4690,8 +4688,6 @@ def store_attachment_bytes(
             content_type=content_type,
             size=len(data),
             uploaded_by=uploaded_by,
-            run_id=run_id,
-            source_url=source_url,
         )
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
@@ -4712,8 +4708,6 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
-    run_id: Optional[int] = None,
-    source_url: Optional[str] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -4755,11 +4749,97 @@ def add_attachment(
                 "filename": filename.strip(),
                 "size": int(size),
                 "by": uploaded_by,
+            },
+        )
+        return attachment_id
+
+
+def store_attachment_from_url(
+    conn: sqlite3.Connection,
+    task_id: str,
+    url: str,
+    filename: str,
+    *,
+    content_type: Optional[str] = None,
+    board: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> tuple[int, int]:
+    """Fetch and attest one URL attachment from the active native worker run.
+
+    Generic byte attachments cannot emit ``attachment_fetched``.  This is the
+    sole operation that does so: it performs the guarded network fetch itself,
+    then revalidates the task/run/claim/profile/PID before recording the
+    fetched-source event used by Delivery V2 production evidence.
+    """
+    from tools.kanban_tools import _download_url_with_cap
+
+    if max_bytes is None:
+        max_bytes = KANBAN_ATTACHMENT_MAX_BYTES
+    data, fetched_type, source_url = _download_url_with_cap(url, max_bytes)
+    task = get_task(conn, task_id)
+    provenance = _active_completion_run_provenance(conn, task) if task else {}
+    now = int(time.time())
+    run_id = provenance.get("run_id")
+    profile = provenance.get("run_profile")
+    if (
+        task is None
+        or task.status != "running"
+        or provenance.get("worker_task_id") != task_id
+        or provenance.get("worker_run_id") != run_id
+        or provenance.get("task_current_run_id") != run_id
+        or not profile
+        or profile != provenance.get("process_profile")
+        or profile != task.assignee
+        or provenance.get("run_status") != "running"
+        or provenance.get("run_ended_at") is not None
+        or not provenance.get("task_claim_lock")
+        or provenance.get("task_claim_lock") != provenance.get("run_claim_lock")
+        or not isinstance(provenance.get("task_claim_expires"), int)
+        or provenance.get("task_claim_expires") <= now
+        or provenance.get("task_claim_expires") != provenance.get("run_claim_expires")
+        or provenance.get("task_worker_pid") != provenance.get("process_pid")
+        or provenance.get("run_worker_pid") != provenance.get("process_pid")
+    ):
+        raise RuntimeError("URL attachment requires this task's active claimed worker run")
+    attachment_id = store_attachment_bytes(
+        conn,
+        task_id,
+        filename,
+        data,
+        content_type=content_type or fetched_type,
+        uploaded_by=profile,
+        board=board,
+        max_bytes=max_bytes,
+    )
+    with write_txn(conn):
+        current = get_task(conn, task_id)
+        current_provenance = (
+            _active_completion_run_provenance(conn, current) if current else {}
+        )
+        if (
+            current is None
+            or current.current_run_id != run_id
+            or current.claim_lock != provenance.get("task_claim_lock")
+            or current.claim_expires != provenance.get("task_claim_expires")
+            or current.worker_pid != provenance.get("task_worker_pid")
+            or current_provenance.get("run_profile") != profile
+            or current_provenance.get("worker_run_id") != run_id
+            or current.claim_expires is None
+            or int(current.claim_expires) <= int(time.time())
+        ):
+            raise RuntimeError("URL attachment claim changed before provenance commit")
+        _append_event(
+            conn,
+            task_id,
+            "attachment_fetched",
+            {
+                "attachment_id": attachment_id,
                 "source_url": source_url,
+                "sha256": hashlib.sha256(data).hexdigest(),
             },
             run_id=run_id,
         )
-        return attachment_id
+    return attachment_id, len(data)
 
 
 def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]:
