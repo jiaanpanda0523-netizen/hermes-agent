@@ -347,3 +347,28 @@ def test_phase_b_dispatch_reroutes_only_an_explicit_sandbox_card(kanban_home):
         assert kb.get_task(conn, task_id).assignee == "ops"
     finally:
         conn.close()
+
+
+def test_phase_b_completion_observer_closes_the_durable_workflow(kanban_home):
+    from plugins.delivery_v2 import on_kanban_task_completed
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="phase b completion canary", body=_phase_b_card_body(), assignee="verifier",
+        )
+        assert kb.set_task_workflow_step(
+            conn,
+            task_id,
+            workflow_template_id="anveros-delivery-v2",
+            current_step_key="PRODUCTION_VERIFY",
+        )
+    finally:
+        conn.close()
+
+    on_kanban_task_completed(task_id=task_id, board="default")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).current_step_key == "DONE"
+    finally:
+        conn.close()

@@ -269,6 +269,37 @@ def before_kanban_task_complete(
     return _decision(issues)
 
 
+def on_kanban_task_completed(*, task_id: str, board: str | None = None, **_: Any) -> None:
+    """Close the enrolled workflow after the native completion transaction.
+
+    ``before_kanban_task_complete`` is deliberately the sole synchronous
+    boundary.  This observer runs only after native Kanban has durably marked
+    the card done, then records the matching Delivery V2 terminal step on the
+    same task row.  A failed observer cannot turn a completed card into a
+    false success because the pre-completion receipt gate has already run.
+    """
+    if not task_id:
+        return
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect(board=board)
+    try:
+        task = kb.get_task(conn, task_id)
+        contract = _contract(task) if task is not None else None
+        if contract is None or _workflow_state(task, contract) != "PRODUCTION_VERIFY":
+            return
+        kb.set_task_workflow_step(
+            conn,
+            task_id,
+            workflow_template_id=WORKFLOW_TEMPLATE,
+            current_step_key="DONE",
+            expected_current_step_key=getattr(task, "current_step_key", None),
+            reason="delivery_v2:PRODUCTION_VERIFY->DONE:native_completion",
+        )
+    finally:
+        conn.close()
+
+
 def _decision(issues: list[str]) -> dict[str, Any]:
     unique = sorted(set(issues))
     if not unique:
@@ -280,6 +311,7 @@ def register(ctx) -> None:
     """Register policy on existing Hermes hook and tool surfaces only."""
     ctx.register_hook("before_kanban_task_complete", before_kanban_task_complete)
     ctx.register_hook("on_kanban_dispatch_tick", on_kanban_dispatch_tick)
+    ctx.register_hook("kanban_task_completed", on_kanban_task_completed)
     ctx.register_tool(
         name="delivery_v2_transition",
         toolset="kanban",
