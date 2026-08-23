@@ -257,6 +257,13 @@ def _before_kanban_task_complete(
 ) -> Optional[str]:
     """Return a veto reason before the authoritative completion write."""
     try:
+        # Completion may be invoked by a worker-side Kanban tool, which does
+        # not otherwise need the plugin registry.  Discover configured plugins
+        # here so a typed completion policy is never silently bypassed merely
+        # because this is the first plugin-aware operation in that process.
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
         from hermes_cli.lifecycle import has_hook, invoke_hook
 
         if not has_hook("before_kanban_task_complete"):
