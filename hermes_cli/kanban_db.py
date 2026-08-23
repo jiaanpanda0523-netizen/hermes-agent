@@ -257,6 +257,13 @@ def _before_kanban_task_complete(
 ) -> Optional[str]:
     """Return a veto reason before the authoritative completion write."""
     try:
+        # Completion may be invoked by a worker-side Kanban tool, which does
+        # not otherwise need the plugin registry.  Discover configured plugins
+        # here so a typed completion policy is never silently bypassed merely
+        # because this is the first plugin-aware operation in that process.
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
         from hermes_cli.lifecycle import has_hook, invoke_hook
 
         if not has_hook("before_kanban_task_complete"):
@@ -3802,6 +3809,65 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
     notify_task_updated(conn, task_id, ("assignee",))
+    return True
+
+
+def set_task_workflow_step(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workflow_template_id: str,
+    current_step_key: str,
+    expected_current_step_key: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Persist one typed workflow step on the existing Kanban task.
+
+    This is deliberately a narrow task-row mutation, not a workflow engine:
+    callers own their transition policy while Hermes continues to own task
+    identity, claims, runs, status, events and recovery.  The compare-and-set
+    guard prevents two actors from silently skipping or overwriting a durable
+    handoff step.
+    """
+    template = str(workflow_template_id or "").strip()
+    step = str(current_step_key or "").strip()
+    if not template or not step:
+        raise ValueError("workflow_template_id and current_step_key are required")
+    expected = (
+        str(expected_current_step_key).strip()
+        if expected_current_step_key is not None
+        else None
+    )
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, workflow_template_id, current_step_key "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot set workflow step on archived task {task_id}")
+        previous_step = row["current_step_key"]
+        if expected is not None and previous_step != expected:
+            return False
+        conn.execute(
+            "UPDATE tasks SET workflow_template_id = ?, current_step_key = ? "
+            "WHERE id = ?",
+            (template, step, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "workflow_step_changed",
+            {
+                "workflow_template_id": template,
+                "previous_step_key": previous_step,
+                "current_step_key": step,
+                "reason": reason,
+            },
+        )
+    notify_task_updated(conn, task_id, ("workflow_template_id", "current_step_key"))
     return True
 
 

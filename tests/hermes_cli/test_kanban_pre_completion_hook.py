@@ -235,3 +235,140 @@ def test_delivery_v2_plugin_allows_verifier_owned_review_run(kanban_home):
             conn.close()
     finally:
         manager._hooks = saved
+
+
+def test_workflow_step_is_durable_and_compare_and_set(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="durable workflow step")
+        assert kb.set_task_workflow_step(
+            conn,
+            task_id,
+            workflow_template_id="anveros-delivery-v2",
+            current_step_key="READY",
+            reason="card admitted",
+        ) is True
+        task = kb.get_task(conn, task_id)
+        assert task.workflow_template_id == "anveros-delivery-v2"
+        assert task.current_step_key == "READY"
+        assert kb.set_task_workflow_step(
+            conn,
+            task_id,
+            workflow_template_id="anveros-delivery-v2",
+            current_step_key="IMPLEMENTING",
+            expected_current_step_key="TRIAGE",
+        ) is False
+        assert kb.set_task_workflow_step(
+            conn,
+            task_id,
+            workflow_template_id="anveros-delivery-v2",
+            current_step_key="IMPLEMENTING",
+            expected_current_step_key="READY",
+        ) is True
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'workflow_step_changed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert json.loads(event["payload"])["current_step_key"] == "IMPLEMENTING"
+
+
+def _phase_b_card_body():
+    return json.dumps({"delivery_v2": {
+        "classification": "NON_PRODUCTION_DELIVERABLE",
+        "role": "IMPLEMENTER",
+        "state": "READY",
+        "implementer": "coder",
+        "role_profiles": {
+            "IMPLEMENTER": "coder",
+            "PRODUCT_VERIFIER": "verifier",
+            "PLATFORM_FIXER": "ops",
+            "RELEASE_OWNER": "orchestrator",
+            "PRODUCTION_VERIFIER": "verifier",
+        },
+        "fallback_profiles": {"coder": "ops"},
+    }})
+
+
+def test_phase_b_transition_persists_steps_and_hands_off_review(kanban_home):
+    from plugins.delivery_v2 import transition_delivery_state
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="phase b state canary", body=_phase_b_card_body(), assignee="coder",
+        )
+    finally:
+        conn.close()
+
+    assert "READY -> IMPLEMENTING" in transition_delivery_state({
+        "task_id": task_id, "actor": "coder", "next_state": "IMPLEMENTING",
+    })
+    assert "IMPLEMENTING -> PREVIEW_READY" in transition_delivery_state({
+        "task_id": task_id, "actor": "coder", "next_state": "PREVIEW_READY",
+    })
+    assert "PREVIEW_READY -> PRODUCT_REVIEW" in transition_delivery_state({
+        "task_id": task_id, "actor": "coder", "next_state": "PRODUCT_REVIEW",
+    })
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task.workflow_template_id == "anveros-delivery-v2"
+        assert task.current_step_key == "PRODUCT_REVIEW"
+        assert task.assignee == "verifier"
+        assert task.status == "review"
+    finally:
+        conn.close()
+
+
+def test_phase_b_dispatch_reroutes_only_an_explicit_sandbox_card(kanban_home):
+    from plugins.delivery_v2 import on_kanban_dispatch_tick
+
+    body = json.loads(_phase_b_card_body())
+    body["delivery_v2"].update({
+        "canary": "SANDBOX_ONLY", "auto_reroute_after_seconds": 1,
+    })
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="phase b reroute canary", body=json.dumps(body), assignee="coder",
+        )
+        conn.execute("UPDATE tasks SET created_at = 0 WHERE id = ?", (task_id,))
+    finally:
+        conn.close()
+
+    on_kanban_dispatch_tick(board="default")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).assignee == "ops"
+    finally:
+        conn.close()
+
+
+def test_phase_b_completion_observer_closes_the_durable_workflow(kanban_home):
+    from plugins.delivery_v2 import on_kanban_task_completed
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="phase b completion canary", body=_phase_b_card_body(), assignee="verifier",
+        )
+        assert kb.set_task_workflow_step(
+            conn,
+            task_id,
+            workflow_template_id="anveros-delivery-v2",
+            current_step_key="PRODUCTION_VERIFY",
+        )
+    finally:
+        conn.close()
+
+    on_kanban_task_completed(task_id=task_id, board="default")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).current_step_key == "DONE"
+    finally:
+        conn.close()
