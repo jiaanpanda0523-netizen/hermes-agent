@@ -100,6 +100,80 @@ def _workflow_state(task: Any, contract: Mapping[str, Any]) -> str:
     return str(state).strip().upper()
 
 
+def _nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _delivery_control_issues(
+    metadata: Any, contract: Mapping[str, Any],
+) -> list[str]:
+    """Validate raw branch/preview facts instead of trusting PASS labels."""
+    controls = metadata.get("delivery_controls") if isinstance(metadata, Mapping) else None
+    if not isinstance(controls, Mapping):
+        return ["DELIVERY_CONTROLS_REQUIRED"]
+
+    issues: list[str] = []
+    writers = controls.get("writer_ids")
+    writer_ids = {
+        _identity(value) for value in writers
+        if _identity(value)
+    } if isinstance(writers, list) else set()
+    if len(writer_ids) != 1:
+        issues.append("ONE_BRANCH_ONE_WRITER_FAILED")
+
+    product_files = controls.get("product_files")
+    platform_files = controls.get("platform_files")
+    product_files = product_files if isinstance(product_files, list) else []
+    platform_files = platform_files if isinstance(platform_files, list) else []
+    if not product_files:
+        issues.append("PRODUCT_DELTA_FILES_REQUIRED")
+    if product_files and platform_files:
+        issues.append("PRODUCT_PLATFORM_PR_MIXED")
+
+    preview_sha = controls.get("preview_head_sha")
+    frozen_sha = controls.get("frozen_head_sha")
+    reviewed_sha = controls.get("reviewed_head_sha")
+    if any(not isinstance(value, str) or _SHA.fullmatch(value) is None
+           for value in (preview_sha, frozen_sha, reviewed_sha)):
+        issues.append("HEAD_FREEZE_SHA_INVALID")
+    elif len({preview_sha, frozen_sha, reviewed_sha}) != 1:
+        issues.append("HEAD_MOVED_AFTER_PREVIEW")
+
+    corrections = _nonnegative_int(controls.get("post_freeze_correction_count"))
+    if corrections is None or corrections > 1:
+        issues.append("POST_FREEZE_CORRECTION_LIMIT_EXCEEDED")
+    elif corrections == 1:
+        authorized_by = _identity(controls.get("correction_authorized_by"))
+        verifier = _role_profiles(contract).get("PRODUCT_VERIFIER", "")
+        if not authorized_by or authorized_by != verifier:
+            issues.append("POST_FREEZE_CORRECTION_NOT_VERIFIER_AUTHORIZED")
+
+    thresholds = {
+        "commit_count": (8, "STOP_SPLIT_COMMITS"),
+        "changed_files": (8, "STOP_SPLIT_CHANGED_FILES"),
+        "net_lines": (400, "STOP_SPLIT_NET_LINES"),
+        "minutes_without_preview": (90, "STOP_SPLIT_PREVIEW_TIMEOUT"),
+    }
+    exceeded: list[str] = []
+    for field, (maximum, reason) in thresholds.items():
+        value = _nonnegative_int(controls.get(field))
+        if value is None:
+            issues.append(f"{field.upper()}_REQUIRED")
+        elif value > maximum:
+            exceeded.append(reason)
+    if exceeded:
+        checkpoint = controls.get("stop_split_checkpoint")
+        checkpoint_verifier = _identity(controls.get("stop_split_verifier"))
+        implementer = _identity(contract.get("implementer"))
+        if checkpoint not in {"SPLIT", "BOUNDED_EXCEPTION"}:
+            issues.extend(exceeded)
+        if not checkpoint_verifier or checkpoint_verifier == implementer:
+            issues.append("STOP_SPLIT_INDEPENDENT_DECISION_REQUIRED")
+    return issues
+
+
 def _role_profiles(contract: Mapping[str, Any]) -> dict[str, str]:
     configured = contract.get("role_profiles")
     configured = configured if isinstance(configured, Mapping) else {}
@@ -263,6 +337,7 @@ def before_kanban_task_complete(
     for field in _REQUIRED_DELIVERY_CONTROLS:
         if receipt.get(field) != "PASS":
             issues.append(f"{field}_PASS_REQUIRED")
+    issues.extend(_delivery_control_issues(metadata, contract))
     if receipt.get("MERGED_SHA") != receipt.get("DEPLOYED_SHA"):
         issues.append("EXACT_SHA_MATCH_FAILED")
 
