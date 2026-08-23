@@ -792,6 +792,42 @@ def test_phase_b_transient_fallback_can_own_the_blocked_verifier_transition(
         conn.close()
 
 
+def test_task_body_fallback_mapping_alone_cannot_delegate_verifier_role(
+    kanban_home, monkeypatch,
+):
+    from plugins.delivery_v2 import transition_delivery_state
+
+    body = json.loads(_phase_b_card_body())
+    body["delivery_v2"]["fallback_profiles"]["verifier"] = "ops"
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="unproven fallback mapping", body=json.dumps(body),
+            assignee="ops",
+        )
+        assert kb.set_task_workflow_step(
+            conn, task_id, workflow_template_id="anveros-delivery-v2",
+            current_step_key="PRODUCT_REVIEW",
+        )
+        assert kb.claim_task(conn, task_id, claimer="ops") is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_PROFILE", "ops")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    result = transition_delivery_state({
+        "task_id": task_id, "next_state": "HEAD_FROZEN",
+    })
+    assert result == "Error: trusted active run provenance does not own this transition."
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).current_step_key == "PRODUCT_REVIEW"
+    finally:
+        conn.close()
+
+
 def test_capability_escalation_does_not_delegate_product_verifier_role(
     kanban_home, monkeypatch,
 ):
