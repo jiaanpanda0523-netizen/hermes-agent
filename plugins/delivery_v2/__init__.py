@@ -29,6 +29,11 @@ _REQUIRED_RECEIPT = (
     "USER_VISIBLE_DELTA_EVIDENCE",
     "ROLLBACK_OR_REVERT_PATH",
 )
+_REQUIRED_DELIVERY_CONTROLS = (
+    "ONE_BRANCH_ONE_WRITER",
+    "PRODUCT_PLATFORM_PR_SEPARATION",
+    "HEAD_FROZEN",
+)
 _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 WORKFLOW_TEMPLATE = "anveros-delivery-v2"
 _STATES = (
@@ -253,6 +258,9 @@ def before_kanban_task_complete(
     if receipt.get("DEPLOYMENT_STATUS") != "SUCCESS":
         issues.append("DEPLOYMENT_STATUS_SUCCESS_REQUIRED")
     for field in ("EXACT_SHA_MATCH", "PRODUCTION_ACCEPTANCE_PROBE"):
+        if receipt.get(field) != "PASS":
+            issues.append(f"{field}_PASS_REQUIRED")
+    for field in _REQUIRED_DELIVERY_CONTROLS:
         if receipt.get(field) != "PASS":
             issues.append(f"{field}_PASS_REQUIRED")
     if receipt.get("MERGED_SHA") != receipt.get("DEPLOYED_SHA"):
