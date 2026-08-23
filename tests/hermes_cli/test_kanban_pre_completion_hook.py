@@ -208,3 +208,30 @@ def test_delivery_v2_plugin_keeps_nonproduction_completion_normal(kanban_home):
             conn.close()
     finally:
         manager._hooks = saved
+
+
+def test_delivery_v2_plugin_allows_verifier_owned_review_run(kanban_home):
+    """Gateway claims the reviewer before it invokes the completion boundary."""
+    manager, saved = _install_delivery_v2_policy()
+    try:
+        conn = kb.connect()
+        try:
+            task_id = kb.create_task(
+                conn, title="production verifier run", body=_production_card_body(),
+                assignee="implementer",
+            )
+            assert kb.claim_task(conn, task_id, claimer="implementer") is not None
+            assert kb.request_review(
+                conn, task_id, reviewer="verifier",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
+            ) is True
+            assert kb.claim_review_task(conn, task_id, claimer="verifier") is not None
+            assert kb.complete_task(
+                conn, task_id, actor="verifier", summary="verified run",
+                metadata=_valid_production_receipt(),
+            ) is True
+            assert kb.get_task(conn, task_id).status == "done"
+        finally:
+            conn.close()
+    finally:
+        manager._hooks = saved

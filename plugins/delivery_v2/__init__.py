@@ -75,7 +75,10 @@ def before_kanban_task_complete(
     if classification != PRODUCTION_CHANGE:
         return _decision(issues or ["TASK_CLASSIFICATION_REQUIRED"])
 
-    if getattr(task, "status", None) != "review":
+    # Native Gateway dispatch claims a reviewer immediately.  The completion
+    # boundary is then a verifier-owned ``running`` review run, rather than a
+    # static ``review`` card.  Identity checks below remain mandatory.
+    if getattr(task, "status", None) not in {"review", "running"}:
         issues.append("INDEPENDENT_REVIEW_STATE_REQUIRED")
     if contract.get("state") != "PRODUCTION_VERIFY":
         issues.append("PRODUCTION_VERIFY_STATE_REQUIRED")
