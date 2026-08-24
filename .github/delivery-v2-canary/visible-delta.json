@@ -1,0 +1,5 @@
+{
+  "canary_scope": "DELIVERY_V2_LIVE_SANDBOX_POLICY_PROBE",
+  "evidence": "Installed Hermes completion boundary blocks missing evidence and permits a structurally valid independently verified receipt on a sandbox Kanban card.",
+  "exact_sha": "35d3eb121e255258e8566596453cf01d996bc132"
+}
