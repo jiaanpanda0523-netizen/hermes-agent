@@ -1,0 +1,7 @@
+{
+  "acceptance_status": "PASS",
+  "canary_scope": "DELIVERY_V2_LIVE_SANDBOX_POLICY_PROBE",
+  "exact_sha": "35d3eb121e255258e8566596453cf01d996bc132",
+  "production_url": "https://raw.githubusercontent.com/jiaanpanda0523-netizen/hermes-agent/canary/delivery-v2-closeout-20260824/.github/delivery-v2-canary/deployment.json",
+  "probe": "installed checkout exact SHA and native completion boundary"
+}
