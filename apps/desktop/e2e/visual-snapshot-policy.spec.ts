@@ -3,7 +3,14 @@ import path from 'node:path'
 
 import { expect, test } from '@playwright/test'
 
-import { expectVisualSnapshot } from './visual-snapshot'
+import { expectVisualSnapshot, visualCandidateCaptureEnabled } from './visual-snapshot'
+
+test('allows candidate capture only when the protected workflow explicitly enables it', () => {
+  expect(visualCandidateCaptureEnabled('all', '1')).toBe(true)
+  expect(visualCandidateCaptureEnabled('changed', '1')).toBe(true)
+  expect(visualCandidateCaptureEnabled('all')).toBe(false)
+  expect(visualCandidateCaptureEnabled('none', '1')).toBe(false)
+})
 
 test('requires an approved baseline instead of accepting a first-run screenshot', async () => {
   const page = {

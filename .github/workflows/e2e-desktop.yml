@@ -113,7 +113,7 @@ jobs:
         working-directory: apps/desktop
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Protected-environment-approved manual dispatch — generating review candidates only"
+            echo "Protected-environment-approved manual dispatch — generating review candidates only; source baselines remain unchanged"
             npm run build && xvfb-run -a --server-args="-screen 0 1280x1024x24" \
               npx playwright test --reporter=list --update-snapshots
           else
@@ -127,13 +127,16 @@ jobs:
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
+          # `visual-snapshot.ts` accepts this only as a candidate-capture
+          # signal. It writes to test-results, never to a source snapshot.
+          HERMES_VISUAL_BASELINE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
 
       # ── Upload manual-review candidates; never publish them as goldens ──
       - name: Upload visual baseline candidates
         if: github.event_name == 'workflow_dispatch' && success()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0 # v7.0.1
         with:
-          path: apps/desktop/e2e/*-snapshots
+          path: apps/desktop/test-results/**/*-candidate.png
           name: visual-baseline-candidates-${{ github.sha }}
           retention-days: 14
           overwrite: true

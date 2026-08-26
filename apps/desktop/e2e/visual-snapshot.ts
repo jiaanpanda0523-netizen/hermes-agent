@@ -41,6 +41,19 @@ export interface VisualSnapshotOptions {
 }
 
 /**
+ * `--update-snapshots` is never an approval to change a source baseline.
+ * The protected GitHub workflow sets the second argument only to capture a
+ * review artifact.  A reviewer must still add any accepted image in a normal
+ * reviewed change.
+ */
+export function visualCandidateCaptureEnabled(
+  updateSnapshots: 'all' | 'changed' | 'missing' | 'none' | undefined,
+  protectedWorkflowFlag = process.env.HERMES_VISUAL_BASELINE_CANDIDATE
+): boolean {
+  return (updateSnapshots === 'all' || updateSnapshots === 'changed') && protectedWorkflowFlag === '1'
+}
+
+/**
  * Force the Electron window to a fixed size so screenshots are comparable
  * across runs and CI environments.  Window managers (Hyprland, etc.) may
  * auto-tile or resize windows after launch; calling this right before the
@@ -88,13 +101,22 @@ export async function expectVisualSnapshot(page: Page, options: VisualSnapshotOp
   const baselinePath = info.snapshotPath(snapshotName ?? `${info.title}.png`)
   const outputName = (snapshotName ?? 'snapshot.png').replace(/\.png$/, '')
 
-  if (info.config.updateSnapshots === 'all' || info.config.updateSnapshots === 'changed') {
-    fs.mkdirSync(path.dirname(baselinePath), { recursive: true })
-    fs.writeFileSync(baselinePath, actual)
-    // Also write to the output dir so CI artifacts include the screenshot.
-    fs.writeFileSync(info.outputPath(`${outputName}-actual.png`), actual)
-    console.log(`[visual-baseline] updated ${baselinePath}`)
+  const updatingSnapshots = info.config.updateSnapshots === 'all' || info.config.updateSnapshots === 'changed'
+
+  if (visualCandidateCaptureEnabled(info.config.updateSnapshots)) {
+    // Deliberately keep candidates under Playwright's disposable output
+    // directory.  This path is uploaded as an artifact and cannot become a
+    // Git baseline unless a human reviews and explicitly adds the file.
+    fs.writeFileSync(info.outputPath(`${outputName}-candidate.png`), actual)
+    console.log(`[visual-candidate] captured ${outputName}; source baselines were not modified`)
     return
+  }
+
+  if (updatingSnapshots) {
+    throw new Error(
+      '[visual-baseline-review-required] Direct snapshot updates are disabled. ' +
+        'Use the protected candidate workflow, review its artifact, then add the approved baseline in a reviewed change.'
+    )
   }
 
   if (!fs.existsSync(baselinePath)) {
