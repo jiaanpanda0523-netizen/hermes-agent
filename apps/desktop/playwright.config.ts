@@ -5,15 +5,13 @@ import { defineConfig, type ReporterDescription } from '@playwright/test'
 /**
  * Visual regression testing config.
  *
- * Screenshots are compared against baselines.  On `main`, baselines are
- * generated with `--update-snapshots` and cached.  On PRs, the cached
- * baselines are restored and screenshots are compared — but tests DON'T
- * fail on visual diffs (see `expectVisualSnapshot` in visual-snapshot.ts).
- * Instead, diffs are surfaced in the CI step summary and uploaded as
- * artifacts for human review.
+ * Screenshots are compared against approved baselines. Regular CI never
+ * rewrites those baselines: a missing or changed image fails and uploads its
+ * diff for review. Only the explicit reviewed baseline-update workflow may
+ * run `--update-snapshots`.
  *
- * To update baselines after an intentional UI change:
- *   npx playwright test --update-snapshots
+ * To update baselines after an intentional UI change, use the reviewed
+ * workflow-dispatch path in `.github/workflows/e2e-desktop.yml`.
  */
 const reporters: ReporterDescription[] = [
   ['list'],

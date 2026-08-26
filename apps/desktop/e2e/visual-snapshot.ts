@@ -1,11 +1,10 @@
 /**
- * Visual snapshot helper — wraps `toHaveScreenshot` so visual diffs are
- * reported without failing the test suite.
+ * Visual snapshot helper — makes a visual baseline an explicit contract.
  *
  * On CI, the JSON reporter + post-test script parse the results and post a
  * summary to the GitHub Actions step output, and diff images are uploaded
- * as artifacts.  This keeps visual regressions visible without gating PRs
- * on pixel-perfect matches.
+ * as artifacts. A missing or changed baseline fails the test: an AI or a
+ * merge must not silently redefine an authored surface as the new golden image.
  *
  * The actual screenshot is always written to the test output dir so CI
  * artifacts include every screenshot — not just the ones that diffed.
@@ -55,9 +54,8 @@ async function forceFixedSize(app: ElectronApplication): Promise<void> {
 /**
  * Take a screenshot and compare it against the baseline.
  *
- * If the baseline doesn't exist yet (first run), Playwright creates it.
- * If it differs, the test logs a soft warning but does NOT fail — the diff
- * images are still generated for CI to surface.
+ * Baselines are created only by the explicit update-snapshots path. Regular
+ * test runs fail closed when no approved baseline exists or it differs.
  */
 export async function expectVisualSnapshot(
   page: Page,
@@ -91,8 +89,10 @@ export async function expectVisualSnapshot(
 
   if (!fs.existsSync(baselinePath)) {
     fs.writeFileSync(info.outputPath(`${outputName}-actual.png`), actual)
-    console.log(`[visual-diff] ${name ?? '(unnamed)'} — no baseline available`)
-    return
+    throw new Error(
+      `[visual-baseline-required] ${name ?? '(unnamed)'} has no approved visual baseline. ` +
+      'Create one only through the reviewed baseline-update workflow.',
+    )
   }
 
   const expected = fs.readFileSync(baselinePath)
@@ -144,7 +144,8 @@ export async function expectVisualSnapshot(
 
   fs.writeFileSync(info.outputPath(`${outputName}-expected.png`), expected)
   fs.writeFileSync(info.outputPath(`${outputName}-diff.png`), Buffer.from(comparison.diff, 'base64'))
-  console.log(
-    `[visual-diff] ${name ?? '(unnamed)'} — ${(comparison.mismatchRatio * 100).toFixed(2)}% of pixels differ`,
+  throw new Error(
+    `[visual-regression] ${name ?? '(unnamed)'} differs from its approved baseline by ` +
+      `${(comparison.mismatchRatio * 100).toFixed(2)}%; inspect the uploaded expected, actual, and diff images.`,
   )
 }

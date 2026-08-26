@@ -6,6 +6,7 @@ on:
       review_status:
         description: Screenshot and visual-diff status for the CI review comment.
         value: ${{ jobs.e2e.outputs.review_status }}
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,7 +16,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  baseline-approval:
+    name: Protected visual-baseline approval
+    if: github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch
+    environment:
+      name: desktop-visual-baseline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record protected-environment approval
+        run: echo 'The protected desktop-visual-baseline environment approved this baseline refresh.'
+
   e2e:
+    needs: baseline-approval
+    if: always() && (github.event_name != 'workflow_dispatch' || needs.baseline-approval.result == 'success')
     name: Playwright E2E (Linux)
     # This job builds the renderer and the electron bundle, then drives a real
     # Electron app under xvfb. vite, tsc and the Playwright workers all scale
@@ -84,36 +97,34 @@ jobs:
       # The Playwright step below runs `npm run build` before testing so
       # dist/ is always fresh — no separate build step needed here.
 
-      # ── Restore visual baseline screenshots from main ──────────────────
-      # Baselines are generated on main (via --update-snapshots) and cached.
-      # On PRs, we restore them so toHaveScreenshot has something to compare
-      # against.  The cache key is keyed on the desktop source files so a
-      # UI change naturally invalidates it — but we fall back to the main
-      # cache to avoid cold starts on unrelated PRs.
+      # ── Restore approved visual baseline screenshots ───────────────────
+      # A cache key includes the commit that received explicit approval. A
+      # prefix restore selects the latest approved main baseline for ordinary
+      # PR/main verification; regular CI never writes a replacement.
       - name: Restore visual baseline screenshots
         id: restore-baselines
         uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: apps/desktop/e2e/*-snapshots
-          key: visual-baselines-${{ github.ref_name }}
+          key: visual-baselines-main-${{ github.sha }}
           restore-keys: |
-            visual-baselines-main
+            visual-baselines-main-
 
       # ── Run Playwright E2E under xvfb ─────────────────────────────────
       # xvfb runs at a fixed 1280x1024 screen so the 1220x800 Electron
       # window always has a consistent viewport for screenshot comparison.
-      # On main, we run with --update-snapshots to generate baselines.
+      # Baselines change only in an explicitly approved manual dispatch.
       # `npm run test:e2e` builds dist/ as a pretest hook so the renderer
       # is always fresh — no separate build step needed.
       - name: Run Playwright E2E tests
         working-directory: apps/desktop
         run: |
-          if [ "${{ github.ref_name }}" = "main" ]; then
-            echo "On main — generating/updating baseline screenshots"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Protected-environment-approved manual dispatch — updating visual baselines"
             npm run build && xvfb-run -a --server-args="-screen 0 1280x1024x24" \
               npx playwright test --reporter=list --update-snapshots
           else
-            echo "On PR — comparing against cached baselines"
+            echo "Comparing against the latest approved baselines"
             npm run build && xvfb-run -a --server-args="-screen 0 1280x1024x24" \
               npx playwright test --reporter=list
           fi
@@ -124,13 +135,13 @@ jobs:
           OPENAI_API_KEY: ''
           NOUS_API_KEY: ''
 
-      # ── Save updated baselines to cache (main only) ───────────────────
-      - name: Save updated baselines to cache
-        if: github.ref_name == 'main' && always()
+      # ── Save approved baselines only ───────────────────────────────────
+      - name: Save approved visual baselines
+        if: github.event_name == 'workflow_dispatch' && success()
         uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
         with:
           path: apps/desktop/e2e/*-snapshots
-          key: visual-baselines-main
+          key: visual-baselines-main-${{ github.sha }}
 
       # ── Upload Playwright report (HTML + traces) ──────────────────────
       - name: Upload Playwright report
@@ -235,7 +246,7 @@ jobs:
           ACTUAL_COUNT=$(find test-results -name '*-actual.png' 2>/dev/null | wc -l)
 
           if [ "$DIFF_COUNT" -eq 0 ]; then
-            echo "✅ All $ACTUAL_COUNT screenshot(s) matched their baselines (or no baselines existed yet)."
+            echo "✅ All $ACTUAL_COUNT screenshot(s) matched their approved baselines."
           else
             echo "📸 **$DIFF_COUNT of $ACTUAL_COUNT screenshot(s) differ from baseline:**"
             echo ""
@@ -263,7 +274,7 @@ jobs:
             echo "- [visual-diffs]($DIFFS_URL) — just the diffed screenshots (small, fast to review)"
           fi
           echo ""
-          echo "**To update baselines:** merge to main (baselines auto-update on main runs) or run \`npx playwright test --update-snapshots\` locally."
+          echo "**To update baselines:** after reviewing visual diffs, run this workflow manually through the protected \`desktop-visual-baseline\` environment."
 
           # Also parse the JSON report for pass/fail counts
           if [ -f playwright-report/results.json ]; then
