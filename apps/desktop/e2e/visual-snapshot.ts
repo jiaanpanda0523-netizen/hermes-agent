@@ -20,6 +20,15 @@ import { type ElectronApplication, type Page, test } from '@playwright/test'
 export const VISUAL_WINDOW_WIDTH = 1220
 export const VISUAL_WINDOW_HEIGHT = 800
 
+// These are live, time- or randomness-derived strings rather than authored
+// layout. Mask them only in the capture page: a visual baseline must measure
+// the designed surface, not whether an updater poll happened to complete or a
+// starter hint was randomly selected on this launch.
+const VISUAL_STABILITY_STYLE = `
+  [role="status"] { visibility: hidden !important; }
+  [data-slot="composer-root"] textarea::placeholder { color: transparent !important; }
+`
+
 export interface VisualSnapshotOptions {
   /** Snapshot name — defaults to the test title. */
   name?: string
@@ -38,17 +47,20 @@ export interface VisualSnapshotOptions {
  * screenshot ensures the viewport is always the expected size.
  */
 async function forceFixedSize(app: ElectronApplication): Promise<void> {
-  await app.evaluate(({ BrowserWindow }, { width, height }) => {
-    const win = BrowserWindow.getAllWindows()[0]
+  await app.evaluate(
+    ({ BrowserWindow }, { width, height }) => {
+      const win = BrowserWindow.getAllWindows()[0]
 
-    if (win) {
-      win.unmaximize()
-      // setMinimumSize must be ≤ the target, otherwise setSize is clamped.
-      win.setMinimumSize(width, height)
-      win.setSize(width, height, false)
-      win.setBounds({ x: 0, y: 0, width, height })
-    }
-  }, { width: VISUAL_WINDOW_WIDTH, height: VISUAL_WINDOW_HEIGHT })
+      if (win) {
+        win.unmaximize()
+        // setMinimumSize must be ≤ the target, otherwise setSize is clamped.
+        win.setMinimumSize(width, height)
+        win.setSize(width, height, false)
+        win.setBounds({ x: 0, y: 0, width, height })
+      }
+    },
+    { width: VISUAL_WINDOW_WIDTH, height: VISUAL_WINDOW_HEIGHT }
+  )
 }
 
 /**
@@ -57,10 +69,7 @@ async function forceFixedSize(app: ElectronApplication): Promise<void> {
  * Baselines are created only by the explicit update-snapshots path. Regular
  * test runs fail closed when no approved baseline exists or it differs.
  */
-export async function expectVisualSnapshot(
-  page: Page,
-  options: VisualSnapshotOptions,
-): Promise<void> {
+export async function expectVisualSnapshot(page: Page, options: VisualSnapshotOptions): Promise<void> {
   const { name, fullPage = false, timeout = 30_000, app } = options
 
   // Force the window to a fixed size right before the screenshot so it's
@@ -68,6 +77,7 @@ export async function expectVisualSnapshot(
   await forceFixedSize(app)
   // Give the renderer a moment to relayout after the resize.
   await page.waitForTimeout(500)
+  await page.addStyleTag({ content: VISUAL_STABILITY_STYLE })
 
   // Playwright appends a platform suffix (e.g. "-linux") and requires
   // a .png extension on the name argument.  Auto-append it if missing.
@@ -91,7 +101,7 @@ export async function expectVisualSnapshot(
     fs.writeFileSync(info.outputPath(`${outputName}-actual.png`), actual)
     throw new Error(
       `[visual-baseline-required] ${name ?? '(unnamed)'} has no approved visual baseline. ` +
-      'Create one only through the reviewed baseline-update workflow.',
+        'Create one only through the reviewed baseline-update workflow.'
     )
   }
 
@@ -128,10 +138,10 @@ export async function expectVisualSnapshot(
 
       return {
         mismatchRatio: mismatched / (actualPixels.length / 4),
-        diff: nativeImage.createFromBitmap(diffPixels, actualSize).toPNG().toString('base64'),
+        diff: nativeImage.createFromBitmap(diffPixels, actualSize).toPNG().toString('base64')
       }
     },
-    { actual: actual.toString('base64'), expected: expected.toString('base64') },
+    { actual: actual.toString('base64'), expected: expected.toString('base64') }
   )
 
   // Always write the actual screenshot to the output dir so CI artifacts
@@ -146,6 +156,6 @@ export async function expectVisualSnapshot(
   fs.writeFileSync(info.outputPath(`${outputName}-diff.png`), Buffer.from(comparison.diff, 'base64'))
   throw new Error(
     `[visual-regression] ${name ?? '(unnamed)'} differs from its approved baseline by ` +
-      `${(comparison.mismatchRatio * 100).toFixed(2)}%; inspect the uploaded expected, actual, and diff images.`,
+      `${(comparison.mismatchRatio * 100).toFixed(2)}%; inspect the uploaded expected, actual, and diff images.`
   )
 }

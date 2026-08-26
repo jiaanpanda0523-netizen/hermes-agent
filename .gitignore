@@ -68,8 +68,11 @@ wandb/
 testlogs
 playwright-report/
 test-results/
-# Playwright visual regression baselines — cached from main in CI, not committed
+# Playwright's desktop visual golden images are reviewed source assets, not
+# disposable test output. Keep every other snapshot directory ignored.
 *-snapshots/
+!apps/desktop/e2e/*-snapshots/
+!apps/desktop/e2e/*-snapshots/**
 
 # CLI config (may contain sensitive SSH paths)
 cli-config.yaml

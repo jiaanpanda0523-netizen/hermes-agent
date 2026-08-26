@@ -1,4 +1,4 @@
-import { type CSSProperties, useState } from 'react'
+import { type CSSProperties } from 'react'
 
 import { capitalize, normalize } from '@/lib/text'
 
@@ -157,8 +157,11 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 }
 
 export function Intro({ personality, seed }: IntroProps) {
-  const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
-  const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+  // `$introSeed` advances when the user starts a fresh session. Do not add
+  // mount-time randomness here: the same empty state must render identically
+  // for visual regression review, and the explicit seed still rotates copy
+  // for each new session.
+  const copy = resolveCopy(personality, seed ?? 0)
 
   return (
     <div

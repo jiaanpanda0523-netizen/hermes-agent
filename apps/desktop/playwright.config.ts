@@ -5,18 +5,17 @@ import { defineConfig, type ReporterDescription } from '@playwright/test'
 /**
  * Visual regression testing config.
  *
- * Screenshots are compared against approved baselines. Regular CI never
- * rewrites those baselines: a missing or changed image fails and uploads its
- * diff for review. Only the explicit reviewed baseline-update workflow may
- * run `--update-snapshots`.
+ * Screenshots are compared against approved baselines committed beside their
+ * tests. Regular CI never rewrites them: a missing or changed image fails and
+ * uploads its diff for review. The explicit protected workflow-dispatch path
+ * may produce a candidate artifact, but only a separately reviewed snapshot
+ * commit can change an approved baseline.
  *
- * To update baselines after an intentional UI change, use the reviewed
- * workflow-dispatch path in `.github/workflows/e2e-desktop.yml`.
+ * To update baselines after an intentional UI change, use the protected
+ * workflow-dispatch candidate path, review the artifact, then commit the
+ * approved image change in a separately reviewed pull request.
  */
-const reporters: ReporterDescription[] = [
-  ['list'],
-  ['html', { open: 'never', outputFolder: 'playwright-report' }],
-]
+const reporters: ReporterDescription[] = [['list'], ['html', { open: 'never', outputFolder: 'playwright-report' }]]
 
 if (process.env.CI) {
   reporters.push(['json', { outputFile: 'playwright-report/results.json' }])
@@ -44,8 +43,8 @@ export default defineConfig({
     // or overlay at a transient opacity because the text-content check fires
     // before the visual transition finishes.
     contextOptions: {
-      reducedMotion: 'reduce',
-    },
+      reducedMotion: 'reduce'
+    }
   },
   expect: {
     toHaveScreenshot: {
@@ -55,7 +54,7 @@ export default defineConfig({
       animations: 'disabled',
       caret: 'hide',
       // Per-channel threshold for "close enough" — anti-aliasing differences.
-      threshold: 0.2,
-    },
-  },
+      threshold: 0.2
+    }
+  }
 })
