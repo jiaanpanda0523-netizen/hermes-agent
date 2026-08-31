@@ -614,7 +614,11 @@ class SessionManager:
 
         from run_agent import AIAgent
         from hermes_cli.config import load_config
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import (
+            CurrentCapabilityUnavailable,
+            enforce_current_capability,
+            resolve_runtime_provider,
+        )
 
         config = load_config()
         model_cfg = config.get("model")
@@ -632,6 +636,7 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
 
+        effective_model = model or default_model
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
@@ -641,11 +646,16 @@ class SessionManager:
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
-            "model": model or default_model,
+            "model": effective_model,
         }
 
+        effective_provider = requested_provider or config_provider
+        enforce_current_capability(effective_provider, effective_model)
         try:
-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            runtime = resolve_runtime_provider(
+                requested=effective_provider,
+                target_model=effective_model,
+            )
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
@@ -656,6 +666,8 @@ class SessionManager:
                     "args": list(runtime.get("args") or []),
                 }
             )
+        except CurrentCapabilityUnavailable:
+            raise
         except Exception:
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 

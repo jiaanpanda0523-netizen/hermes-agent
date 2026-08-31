@@ -4806,13 +4806,18 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         max_output_tokens = None
         if configured_provider:
             try:
-                from hermes_cli.runtime_provider import resolve_runtime_provider
+                from hermes_cli.runtime_provider import (
+                    CurrentCapabilityUnavailable,
+                    resolve_runtime_provider,
+                )
 
                 runtime = resolve_runtime_provider(
                     requested=configured_provider, target_model=configured_model
                 )
                 request_overrides = dict(runtime.get("request_overrides") or {}) or None
                 max_output_tokens = runtime.get("max_output_tokens")
+            except CurrentCapabilityUnavailable:
+                raise
             except Exception as exc:
                 logger.debug(
                     "delegation.base_url: runtime resolution for provider '%s' "
@@ -4827,6 +4832,12 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             request_overrides, explicit_request_overrides
         )
 
+        from hermes_cli.runtime_provider import enforce_current_capability
+
+        enforce_current_capability(
+            configured_provider or provider,
+            configured_model,
+        )
         return {
             "model": configured_model,
             "provider": provider,
@@ -4844,6 +4855,13 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         # in pure-inherit setups (never a silent no-op). None when neither
         # side has values → _build_child_agent falls back to the parent's
         # request_overrides unchanged.
+        from hermes_cli.runtime_provider import enforce_current_capability
+
+        enforce_current_capability(
+            getattr(parent_agent, "requested_provider", None)
+            or getattr(parent_agent, "provider", None),
+            configured_model or getattr(parent_agent, "model", None),
+        )
         return {
             "model": configured_model,
             "provider": None,
@@ -4859,9 +4877,17 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     # Provider is configured — resolve full credentials
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import (
+            CurrentCapabilityUnavailable,
+            resolve_runtime_provider,
+        )
 
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
+        runtime = resolve_runtime_provider(
+            requested=configured_provider,
+            target_model=configured_model,
+        )
+    except CurrentCapabilityUnavailable:
+        raise
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "

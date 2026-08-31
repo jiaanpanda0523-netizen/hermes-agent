@@ -104,11 +104,18 @@ fallback_providers:
     )
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
+    def fake_resolve_runtime_provider(
+        *,
+        requested=None,
+        target_model=None,
+        explicit_base_url=None,
+        explicit_api_key=None,
+    ):
         if requested in {None, "", "openai-codex"}:
             from hermes_cli.auth import AuthError
             raise AuthError("No Codex credentials stored. Run `hermes auth` to authenticate.")
         assert requested == "openrouter"
+        assert target_model == "minimax/minimax-m2.7"
         return {
             "api_key": "sk-openrouter",
             "base_url": "https://openrouter.ai/api/v1",
@@ -135,5 +142,4 @@ fallback_providers:
     assert model == "minimax/minimax-m2.7"
     assert runtime_kwargs["provider"] == "openrouter"
     assert runtime_kwargs["api_key"] == "sk-openrouter"
-
 

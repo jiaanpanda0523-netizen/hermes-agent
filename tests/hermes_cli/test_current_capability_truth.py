@@ -165,6 +165,18 @@ def _set_claude_truth_state(
     service["effective_ready"] = effective_ready
     service["effective_capability"]["entitlement_state"] = entitlement_state
     service["effective_capability"]["access_reachable"] = effective_ready
+    service["effective_capability"]["task_bound_probes"] = (
+        {
+            "repository_engineering": {
+                "state": "passed",
+                "task_class": "repository_engineering",
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "ttl_seconds": 21600,
+            }
+        }
+        if effective_ready
+        else {}
+    )
     truth_path.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -318,6 +330,90 @@ def test_internally_inconsistent_ready_disabled_truth_fails_closed(
     }
 
 
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_routing",
+        "routing_wrong_type",
+        "missing_claude_route",
+        "claude_route_wrong_type",
+        "route_enabled_missing",
+        "missing_overrides",
+        "overrides_wrong_type",
+        "claude_override_wrong_type",
+        "empty_desired_state",
+        "non_boolean_route_enabled",
+        "generation_boolean",
+        "duplicate_claude_service",
+        "ready_missing_task_classes",
+        "ready_missing_task_probes",
+        "ready_empty_task_probes",
+    ],
+)
+def test_structurally_malformed_self_hashed_truth_fails_closed(
+    monkeypatch, tmp_path, malformation
+):
+    truth_path = _configure_truth(monkeypatch, tmp_path)
+    _set_claude_truth_state(
+        truth_path,
+        route_enabled=True,
+        capability_state="READY",
+        effective_ready=True,
+        entitlement_state="enabled",
+    )
+    payload = json.loads(truth_path.read_text(encoding="utf-8"))
+    desired = payload["desired_state"]
+    if malformation == "missing_routing":
+        desired.pop("routing")
+    elif malformation == "routing_wrong_type":
+        desired["routing"] = []
+    elif malformation == "missing_claude_route":
+        desired["routing"].pop("claude_code")
+    elif malformation == "claude_route_wrong_type":
+        desired["routing"]["claude_code"] = []
+    elif malformation == "route_enabled_missing":
+        desired["routing"]["claude_code"].pop("enabled")
+    elif malformation == "missing_overrides":
+        desired.pop("founder_entitlement_overrides")
+    elif malformation == "overrides_wrong_type":
+        desired["founder_entitlement_overrides"] = []
+        payload["founder_entitlement_overrides"] = []
+    elif malformation == "claude_override_wrong_type":
+        desired["founder_entitlement_overrides"]["claude"] = []
+        payload["founder_entitlement_overrides"] = desired[
+            "founder_entitlement_overrides"
+        ]
+    elif malformation == "empty_desired_state":
+        desired.clear()
+    elif malformation == "non_boolean_route_enabled":
+        desired["routing"]["claude_code"]["enabled"] = "false"
+    elif malformation == "generation_boolean":
+        payload["desired_generation"] = True
+    elif malformation == "duplicate_claude_service":
+        payload["services"].append(dict(payload["services"][0]))
+    elif malformation == "ready_missing_task_classes":
+        payload["services"][0]["effective_capability"].pop(
+            "supported_task_classes"
+        )
+    elif malformation == "ready_missing_task_probes":
+        payload["services"][0]["effective_capability"].pop(
+            "task_bound_probes"
+        )
+    elif malformation == "ready_empty_task_probes":
+        payload["services"][0]["effective_capability"]["task_bound_probes"] = {}
+    payload["desired_state_sha256"] = _desired_sha256(desired)
+    truth_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    from hermes_cli.runtime_provider import current_capability_admission
+
+    admission = current_capability_admission("anthropic", "claude-sonnet-5")
+    assert admission["available"] is False
+    assert admission["reason"] in {
+        "capability_truth_structure_invalid",
+        "desired_generation_missing_or_invalid",
+    }
+
+
 def test_alias_switch_is_rejected_before_ambient_credentials_can_continue(
     monkeypatch, tmp_path
 ):
@@ -407,6 +503,94 @@ def test_cli_primary_checks_live_target_model(monkeypatch, tmp_path):
 
     assert stub._ensure_runtime_credentials() is False
     assert stub.model == "anthropic/claude-sonnet-5"
+
+
+def test_messaging_gateway_fallback_checks_target_model(monkeypatch, tmp_path):
+    _configure_truth(monkeypatch, tmp_path)
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {
+            "fallback_model": {
+                "provider": "local-qwen",
+                "model": "anthropic/claude-sonnet-5",
+            }
+        },
+    )
+
+    assert gateway_run._try_resolve_fallback_provider() is None
+
+
+def test_messaging_gateway_final_runtime_identity_is_admitted(
+    monkeypatch, tmp_path
+):
+    _configure_truth(monkeypatch, tmp_path)
+    from gateway.run import _enforce_runtime_model_current_capability
+
+    with pytest.raises(Exception, match="entitlement_disabled"):
+        _enforce_runtime_model_current_capability(
+            "anthropic/claude-sonnet-5",
+            {"provider": "local-qwen", "requested_provider": "local-qwen"},
+        )
+
+
+def test_acp_agent_build_checks_effective_model_identity(monkeypatch, tmp_path):
+    _configure_truth(monkeypatch, tmp_path)
+    import run_agent
+    from acp_adapter.session import SessionManager
+
+    monkeypatch.setattr(run_agent, "AIAgent", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    manager = SessionManager(db=SimpleNamespace())
+    with pytest.raises(Exception, match="entitlement_disabled"):
+        manager._make_agent(
+            session_id="acp-current-truth",
+            cwd=str(tmp_path),
+            model="anthropic/claude-sonnet-5",
+            requested_provider="local-qwen",
+        )
+
+
+def test_delegation_direct_endpoint_cannot_swallow_policy_denial(
+    monkeypatch, tmp_path
+):
+    _configure_truth(monkeypatch, tmp_path)
+    from tools.delegate_tool import _resolve_delegation_credentials
+
+    parent = SimpleNamespace(
+        model="qwen3-coder",
+        provider="local-qwen",
+        api_key="no-key-required",
+        base_url="http://127.0.0.1:1234/v1",
+        api_mode="chat_completions",
+        request_overrides=None,
+    )
+    with pytest.raises(Exception, match="entitlement_disabled"):
+        _resolve_delegation_credentials(
+            {
+                "provider": "local-qwen",
+                "model": "anthropic/claude-sonnet-5",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "api_key": "no-key-required",
+            },
+            parent,
+        )
+
+
+def test_long_lived_tui_agent_rechecks_truth_at_turn_boundary(
+    monkeypatch, tmp_path
+):
+    _configure_truth(monkeypatch, tmp_path)
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent.requested_provider = "local-qwen"
+    agent.provider = "local-qwen"
+    agent.model = "anthropic/claude-sonnet-5"
+    with pytest.raises(Exception, match="entitlement_disabled"):
+        agent.run_conversation("must stop before any retained client call")
 
 
 def test_cli_resume_keeps_ambient_runtime_when_history_used_claude(

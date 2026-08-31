@@ -192,7 +192,7 @@ def current_capability_admission(
     generation = payload.get("desired_generation")
     desired_state = payload.get("desired_state")
     declared_hash = payload.get("desired_state_sha256")
-    if not isinstance(generation, int) or generation < 1:
+    if type(generation) is not int or generation < 1:
         return {
             "available": False,
             "reason": "desired_generation_missing_or_invalid",
@@ -203,15 +203,95 @@ def current_capability_admission(
         desired_state
     ):
         return {"available": False, "reason": "desired_state_sha256_mismatch"}
+    routing = desired_state.get("routing")
+    claude_route = routing.get("claude_code") if isinstance(routing, dict) else None
     desired_overrides = desired_state.get("founder_entitlement_overrides")
     projected_overrides = payload.get("founder_entitlement_overrides")
-    if (
-        isinstance(desired_overrides, dict)
-        and desired_overrides != projected_overrides
+    if not (
+        isinstance(routing, dict)
+        and isinstance(claude_route, dict)
+        and type(claude_route.get("enabled")) is bool
+        and isinstance(desired_overrides, dict)
+        and isinstance(projected_overrides, dict)
     ):
         return {
             "available": False,
+            "reason": "capability_truth_structure_invalid",
+        }
+    if desired_overrides != projected_overrides:
+        return {
+            "available": False,
             "reason": "founder_entitlement_projection_mismatch",
+        }
+    for alias in ("claude", "claude_code"):
+        if alias not in desired_overrides:
+            continue
+        override = desired_overrides.get(alias)
+        if not isinstance(override, dict) or str(
+            override.get("state") or ""
+        ).strip().lower() not in {"enabled", "disabled"}:
+            return {
+                "available": False,
+                "reason": "capability_truth_structure_invalid",
+            }
+
+    services = payload.get("services")
+    claude_services = (
+        [
+            service
+            for service in services
+            if isinstance(service, dict)
+            and str(service.get("name") or "").strip().lower() == "claude"
+        ]
+        if isinstance(services, list)
+        else []
+    )
+    if len(claude_services) != 1:
+        return {
+            "available": False,
+            "reason": "capability_truth_structure_invalid",
+        }
+    claude_service = claude_services[0]
+    capability = claude_service.get("effective_capability")
+    if not isinstance(capability, dict):
+        return {
+            "available": False,
+            "reason": "capability_truth_structure_invalid",
+        }
+    state_value = claude_service.get("capability_state")
+    ready_value = claude_service.get("effective_ready")
+    entitlement_value = capability.get("entitlement_state")
+    reachable_value = capability.get("access_reachable")
+    supported_task_classes = capability.get("supported_task_classes")
+    task_bound_probes = capability.get("task_bound_probes")
+    if not (
+        isinstance(state_value, str)
+        and state_value.strip().upper()
+        in {
+            "READY",
+            "DISABLED",
+            "NOT_READY",
+            "RECONCILING",
+            "ERROR",
+            "STALE",
+            "FATAL",
+        }
+        and type(ready_value) is bool
+        and isinstance(entitlement_value, str)
+        and entitlement_value.strip().lower()
+        in {"enabled", "disabled", "unknown", "fatal", "error"}
+        and type(reachable_value) is bool
+        and isinstance(supported_task_classes, list)
+        and bool(supported_task_classes)
+        and all(
+            isinstance(task_class, str) and bool(task_class.strip())
+            for task_class in supported_task_classes
+        )
+        and isinstance(task_bound_probes, dict)
+    ):
+        return {
+            "available": False,
+            "reason": "capability_truth_structure_invalid",
         }
 
     generated_at = _parse_capability_truth_timestamp(payload.get("generated_at_kst"))
@@ -229,9 +309,7 @@ def current_capability_admission(
     if age_seconds < -_CAPABILITY_TRUTH_CLOCK_SKEW_SECONDS:
         return {"available": False, "reason": "capability_truth_from_future"}
 
-    routing = desired_state.get("routing")
-    claude_route = routing.get("claude_code") if isinstance(routing, dict) else None
-    if isinstance(claude_route, dict) and claude_route.get("enabled") is False:
+    if claude_route.get("enabled") is False:
         return {"available": False, "reason": "entitlement_disabled"}
     for alias in ("claude", "claude_code"):
         override = (
@@ -244,20 +322,6 @@ def current_capability_admission(
         ).lower() == "disabled":
             return {"available": False, "reason": "entitlement_disabled"}
 
-    services = payload.get("services")
-    claude_service = next(
-        (
-            service
-            for service in services
-            if isinstance(service, dict)
-            and str(service.get("name") or "").strip().lower() == "claude"
-        ),
-        None,
-    ) if isinstance(services, list) else None
-    if not isinstance(claude_service, dict):
-        return {"available": False, "reason": "claude_capability_missing"}
-    capability = claude_service.get("effective_capability")
-    capability = capability if isinstance(capability, dict) else {}
     entitlement = str(capability.get("entitlement_state") or "unknown").lower()
     if entitlement == "disabled":
         return {"available": False, "reason": "entitlement_disabled"}
@@ -280,6 +344,32 @@ def current_capability_admission(
             "available": False,
             "reason": "capability_truth_inconsistent",
         }
+    if effective_ready is True:
+        fresh_probe_found = False
+        for task_class in supported_task_classes:
+            probe = task_bound_probes.get(task_class)
+            if not isinstance(probe, dict):
+                continue
+            probe_at = _parse_capability_truth_timestamp(probe.get("observed_at"))
+            ttl_seconds = probe.get("ttl_seconds")
+            if not (
+                str(probe.get("state") or "").strip().lower()
+                in {"passed", "success", "ready"}
+                and str(probe.get("task_class") or "") == task_class
+                and probe_at is not None
+                and type(ttl_seconds) is int
+                and ttl_seconds > 0
+            ):
+                continue
+            probe_age = (now - probe_at).total_seconds()
+            if -_CAPABILITY_TRUTH_CLOCK_SKEW_SECONDS <= probe_age <= ttl_seconds:
+                fresh_probe_found = True
+                break
+        if not fresh_probe_found:
+            return {
+                "available": False,
+                "reason": "capability_truth_structure_invalid",
+            }
     if effective_ready is not True:
         return {"available": False, "reason": f"capability_{state.lower()}"}
     return {

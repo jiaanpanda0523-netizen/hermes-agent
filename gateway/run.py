@@ -3335,6 +3335,7 @@ def _try_resolve_fallback_provider() -> dict | None:
 
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),
+                    target_model=entry.get("model"),
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=resolve_entry_api_key(entry),
                 )
@@ -3366,6 +3367,14 @@ def _try_resolve_fallback_provider() -> dict | None:
     except Exception:
         pass
     return None
+
+
+def _enforce_runtime_model_current_capability(model: str, runtime: dict) -> None:
+    """Admit the final model identity after all gateway overrides converge."""
+    from hermes_cli.runtime_provider import enforce_current_capability
+
+    provider = runtime.get("requested_provider") or runtime.get("provider")
+    enforce_current_capability(provider, model)
 
 
 def _event_media_type_at(event, index: int) -> str:
@@ -8558,6 +8567,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     resolved_session_key or "", model, override_model,
                     override_runtime.get("provider"),
                 )
+                _enforce_runtime_model_current_capability(
+                    override_model, override_runtime
+                )
                 return override_model, override_runtime
             # Override exists but has no api_key — fall through to env-based
             # resolution and apply model/provider from the override on top.
@@ -8673,6 +8685,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ).conversation.last_resolved_model = model
             self._session_state("*").conversation.last_resolved_model = model
 
+        _enforce_runtime_model_current_capability(model, runtime_kwargs)
         return model, runtime_kwargs
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:

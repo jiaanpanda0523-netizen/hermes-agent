@@ -1917,6 +1917,14 @@ def switch_model(
                 api_mode = runtime.get("api_mode", "")
                 runtime_capabilities = runtime.get("capabilities") or {}
                 validation_headers = runtime.get("extra_headers") or validation_headers
+            except CurrentCapabilityUnavailable as exc:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=provider_label,
+                    is_global=is_global,
+                    error_message=str(exc),
+                )
             except Exception:
                 api_key = _ukey
                 base_url = _user_pdef.base_url
@@ -2232,6 +2240,22 @@ def switch_model(
             request_overrides = _custom_provider_request_overrides(_cp_for_ro) or None
     except Exception:
         request_overrides = None
+
+    # A long validation or discovery call can span a truth transition. Recheck
+    # the final provider/model pair so READY -> DISABLED cannot be swallowed by
+    # a legacy credential fallback or admitted at the selection boundary.
+    try:
+        from hermes_cli.runtime_provider import enforce_current_capability
+
+        enforce_current_capability(target_provider, new_model)
+    except CurrentCapabilityUnavailable as exc:
+        return ModelSwitchResult(
+            success=False,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=str(exc),
+        )
 
     # --- Build result ---
     return ModelSwitchResult(

@@ -419,6 +419,16 @@ class _StreamErrorEvent(Exception):
         }
 
 
+def _enforce_agent_current_capability(agent) -> None:
+    """Recheck current truth at the shared per-turn execution boundary."""
+    from hermes_cli.runtime_provider import enforce_current_capability
+
+    provider = getattr(agent, "requested_provider", None) or getattr(
+        agent, "provider", None
+    )
+    enforce_current_capability(provider, getattr(agent, "model", None))
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -8690,6 +8700,7 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        _enforce_agent_current_capability(self)
         # A review deliberately shares this agent's session_id for prompt-cache
         # parity. Fence review startup or interrupt an admitted request, then
         # await that request's exit before opening any live-turn Relay or task
