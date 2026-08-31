@@ -355,6 +355,17 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     """
     provider = str(slot.get("provider") or "").strip()
     model = str(slot.get("model") or "").strip()
+    from hermes_cli.runtime_provider import (
+        CurrentCapabilityUnavailable,
+        enforce_current_capability,
+        resolve_runtime_provider,
+    )
+
+    # Cache only the comparatively expensive runtime/credential resolution.
+    # Current capability truth is deliberately re-read before every cache hit
+    # so a READY -> DISABLED transition takes effect immediately rather than
+    # leaving a Claude route callable for the cache TTL.
+    enforce_current_capability(provider, model)
     cache_key = (provider, model)
     now = time.monotonic()
     with _runtime_cache_lock:
@@ -365,11 +376,6 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
             return cached
     out: dict[str, Any] = {"provider": provider, "model": model}
     try:
-        from hermes_cli.runtime_provider import (
-            CurrentCapabilityUnavailable,
-            resolve_runtime_provider,
-        )
-
         rt = resolve_runtime_provider(requested=provider, target_model=model)
         if rt.get("base_url"):
             out["base_url"] = rt["base_url"]

@@ -261,9 +261,27 @@ def current_capability_admission(
     entitlement = str(capability.get("entitlement_state") or "unknown").lower()
     if entitlement == "disabled":
         return {"available": False, "reason": "entitlement_disabled"}
-    if claude_service.get("effective_ready") is not True:
-        state = str(claude_service.get("capability_state") or "NOT_READY").lower()
-        return {"available": False, "reason": f"capability_{state}"}
+    state = str(
+        claude_service.get("capability_state") or "NOT_READY"
+    ).strip().upper()
+    effective_ready = claude_service.get("effective_ready")
+    access_reachable = capability.get("access_reachable")
+    if effective_ready is True and (
+        state != "READY"
+        or entitlement != "enabled"
+        or access_reachable is not True
+    ):
+        return {
+            "available": False,
+            "reason": "capability_truth_inconsistent",
+        }
+    if state == "READY" and effective_ready is not True:
+        return {
+            "available": False,
+            "reason": "capability_truth_inconsistent",
+        }
+    if effective_ready is not True:
+        return {"available": False, "reason": f"capability_{state.lower()}"}
     return {
         "available": True,
         "reason": "effective_capability_ready",

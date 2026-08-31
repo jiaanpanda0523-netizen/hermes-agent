@@ -140,6 +140,34 @@ def _configure_truth(
     return truth_path
 
 
+def _set_claude_truth_state(
+    truth_path,
+    *,
+    route_enabled: bool,
+    capability_state: str,
+    effective_ready: bool,
+    entitlement_state: str,
+):
+    payload = json.loads(truth_path.read_text(encoding="utf-8"))
+    if route_enabled:
+        overrides = {}
+    else:
+        overrides = payload["founder_entitlement_overrides"]
+    desired = {
+        "routing": {"claude_code": {"enabled": route_enabled}},
+        "founder_entitlement_overrides": overrides,
+    }
+    payload["desired_state"] = desired
+    payload["desired_state_sha256"] = _desired_sha256(desired)
+    payload["founder_entitlement_overrides"] = overrides
+    service = payload["services"][0]
+    service["capability_state"] = capability_state
+    service["effective_ready"] = effective_ready
+    service["effective_capability"]["entitlement_state"] = entitlement_state
+    service["effective_capability"]["access_reachable"] = effective_ready
+    truth_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def test_direct_and_alias_shaped_claude_routes_are_denied_by_current_truth(
     monkeypatch, tmp_path
 ):
@@ -241,6 +269,55 @@ def test_moa_cannot_fall_open_to_a_bare_claude_slot(monkeypatch, tmp_path):
     assert moa._runtime_cache == {}
 
 
+def test_moa_cached_runtime_is_rechecked_after_truth_turns_disabled(
+    monkeypatch, tmp_path
+):
+    truth_path = _configure_truth(monkeypatch, tmp_path)
+    _set_claude_truth_state(
+        truth_path,
+        route_enabled=True,
+        capability_state="READY",
+        effective_ready=True,
+        entitlement_state="enabled",
+    )
+    import agent.moa_loop as moa
+
+    moa._runtime_cache.clear()
+    slot = {"provider": "claude-max-meridian", "model": "claude-opus-5"}
+    assert moa._slot_runtime(slot)["provider"] == "claude-max-meridian"
+    assert moa._runtime_cache
+
+    _set_claude_truth_state(
+        truth_path,
+        route_enabled=False,
+        capability_state="DISABLED",
+        effective_ready=False,
+        entitlement_state="disabled",
+    )
+    with pytest.raises(Exception, match="entitlement_disabled"):
+        moa._slot_runtime(slot)
+
+
+def test_internally_inconsistent_ready_disabled_truth_fails_closed(
+    monkeypatch, tmp_path
+):
+    truth_path = _configure_truth(monkeypatch, tmp_path)
+    _set_claude_truth_state(
+        truth_path,
+        route_enabled=True,
+        capability_state="DISABLED",
+        effective_ready=True,
+        entitlement_state="enabled",
+    )
+    from hermes_cli.runtime_provider import current_capability_admission
+
+    admission = current_capability_admission("anthropic", "claude-sonnet-5")
+    assert admission == {
+        "available": False,
+        "reason": "capability_truth_inconsistent",
+    }
+
+
 def test_alias_switch_is_rejected_before_ambient_credentials_can_continue(
     monkeypatch, tmp_path
 ):
@@ -278,6 +355,58 @@ def test_disabled_primary_advances_to_non_claude_fallback(monkeypatch, tmp_path)
     assert result.used_fallback is True
     assert result.selected_model == "qwen3-coder"
     assert result.runtime["requested_provider"] == "local-qwen"
+
+
+def test_cli_fallback_checks_target_model_before_assigning_it(monkeypatch, tmp_path):
+    _configure_truth(monkeypatch, tmp_path)
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    stub = object.__new__(CLIAgentSetupMixin)
+    stub.requested_provider = "claude-max-meridian"
+    stub.provider = "local-qwen"
+    stub.model = "qwen3-coder"
+    stub.api_key = "no-key-required"
+    stub.base_url = "http://127.0.0.1:1234/v1"
+    stub.api_mode = "chat_completions"
+    stub.acp_command = None
+    stub.acp_args = []
+    stub.agent = None
+    stub._explicit_api_key = None
+    stub._explicit_base_url = None
+    stub._fallback_model = [
+        {
+            "provider": "local-qwen",
+            "model": "anthropic/claude-sonnet-5",
+        }
+    ]
+    stub._normalize_model_for_provider = lambda _provider: False
+
+    assert stub._ensure_runtime_credentials() is False
+    assert stub.model == "qwen3-coder"
+    assert stub.requested_provider == "claude-max-meridian"
+
+
+def test_cli_primary_checks_live_target_model(monkeypatch, tmp_path):
+    _configure_truth(monkeypatch, tmp_path)
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+
+    stub = object.__new__(CLIAgentSetupMixin)
+    stub.requested_provider = "local-qwen"
+    stub.provider = "local-qwen"
+    stub.model = "anthropic/claude-sonnet-5"
+    stub.api_key = "no-key-required"
+    stub.base_url = "http://127.0.0.1:1234/v1"
+    stub.api_mode = "chat_completions"
+    stub.acp_command = None
+    stub.acp_args = []
+    stub.agent = None
+    stub._explicit_api_key = None
+    stub._explicit_base_url = None
+    stub._fallback_model = []
+    stub._normalize_model_for_provider = lambda _provider: False
+
+    assert stub._ensure_runtime_credentials() is False
+    assert stub.model == "anthropic/claude-sonnet-5"
 
 
 def test_cli_resume_keeps_ambient_runtime_when_history_used_claude(
