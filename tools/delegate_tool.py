@@ -4917,8 +4917,15 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
                 f"Install it or choose a different delegation provider."
             )
 
+    effective_model = configured_model or runtime.get("model") or None
+    from hermes_cli.runtime_provider import enforce_current_capability
+
+    enforce_current_capability(
+        runtime.get("requested_provider") or configured_provider,
+        effective_model,
+    )
     return {
-        "model": configured_model or runtime.get("model") or None,
+        "model": effective_model,
         "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
         "base_url": runtime.get("base_url"),
         "api_key": api_key,

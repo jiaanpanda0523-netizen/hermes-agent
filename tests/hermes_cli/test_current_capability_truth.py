@@ -579,6 +579,37 @@ def test_delegation_direct_endpoint_cannot_swallow_policy_denial(
         )
 
 
+def test_named_delegation_checks_runtime_supplied_default_model(
+    monkeypatch, tmp_path
+):
+    _configure_truth(monkeypatch, tmp_path)
+    import hermes_cli.runtime_provider as runtime_provider
+    from tools.delegate_tool import _resolve_delegation_credentials
+
+    monkeypatch.setattr(
+        runtime_provider,
+        "resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "custom",
+            "requested_provider": "researcher",
+            "model": "anthropic/claude-sonnet-5",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "api_key": "no-key-required",
+            "api_mode": "chat_completions",
+        },
+    )
+
+    with pytest.raises(Exception, match="entitlement_disabled"):
+        _resolve_delegation_credentials(
+            {"provider": "researcher"},
+            SimpleNamespace(
+                model="qwen3-coder",
+                provider="local-qwen",
+                request_overrides=None,
+            ),
+        )
+
+
 def test_long_lived_tui_agent_rechecks_truth_at_turn_boundary(
     monkeypatch, tmp_path
 ):
