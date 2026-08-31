@@ -53,6 +53,8 @@ class ConfigContext:
     user_providers: dict
     custom_providers: list
     excluded_providers: list = None
+    capability_truth_file: str = ""
+    capability_truth_max_age_seconds: int = 21600
 
     def with_overrides(
         self,
@@ -103,7 +105,15 @@ def load_picker_context() -> ConfigContext:
         current_model = str(model_cfg) if model_cfg else ""
         current_provider = ""
         current_base_url = ""
-    excluded = cfg.get("model_catalog", {}).get("excluded_providers") or []
+    catalog_cfg = cfg.get("model_catalog")
+    catalog_cfg = catalog_cfg if isinstance(catalog_cfg, dict) else {}
+    excluded = catalog_cfg.get("excluded_providers") or []
+    try:
+        truth_max_age = max(
+            1, int(catalog_cfg.get("capability_truth_max_age_seconds", 21600))
+        )
+    except (TypeError, ValueError):
+        truth_max_age = 21600
     return ConfigContext(
         current_provider=current_provider,
         current_model=current_model,
@@ -111,7 +121,56 @@ def load_picker_context() -> ConfigContext:
         user_providers=stringify_provider_map(cfg.get("providers")),
         custom_providers=get_compatible_custom_providers(cfg),
         excluded_providers=excluded if isinstance(excluded, list) else [],
+        capability_truth_file=str(
+            catalog_cfg.get("capability_truth_file") or ""
+        ).strip(),
+        capability_truth_max_age_seconds=truth_max_age,
     )
+
+
+def _filter_currently_available_rows(
+    rows: list[dict], ctx: ConfigContext
+) -> list[dict]:
+    """Remove provider/model choices rejected by configured current truth."""
+    from hermes_cli.runtime_provider import (
+        current_capability_admission,
+        is_claude_runtime,
+    )
+
+    claude_admission = current_capability_admission(
+        "anthropic",
+        "claude",
+        truth_path=ctx.capability_truth_file,
+        max_age_seconds=ctx.capability_truth_max_age_seconds,
+    )
+    if claude_admission.get("available"):
+        return rows
+
+    kept_rows: list[dict] = []
+    for original in rows:
+        row = dict(original)
+        slug = str(row.get("slug") or "").strip()
+        models = list(row.get("models") or [])
+        if is_claude_runtime(slug, None):
+            continue
+        filtered_models = [
+            model
+            for model in models
+            if not is_claude_runtime(slug, str(model or ""))
+        ]
+        if models and not filtered_models:
+            continue
+        if len(filtered_models) != len(models):
+            row["models"] = filtered_models
+            row["total_models"] = len(filtered_models)
+            featured = row.get("featured_models")
+            if isinstance(featured, list):
+                allowed = {str(model) for model in filtered_models}
+                row["featured_models"] = [
+                    model for model in featured if str(model) in allowed
+                ]
+        kept_rows.append(row)
+    return kept_rows
 
 
 # ─── Public: payload builder ────────────────────────────────────────────
@@ -268,6 +327,7 @@ def build_models_payload(
 
     if include_unconfigured:
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
+    rows = _filter_currently_available_rows(rows, ctx)
     if picker_hints:
         _apply_picker_hints(rows)
     if canonical_order:
@@ -280,10 +340,20 @@ def build_models_payload(
         _apply_featured(rows)
     _apply_custom_aliases(rows)
 
+    from hermes_cli.runtime_provider import current_capability_admission
+
+    current_admission = current_capability_admission(
+        ctx.current_provider,
+        ctx.current_model,
+        truth_path=ctx.capability_truth_file,
+        max_age_seconds=ctx.capability_truth_max_age_seconds,
+    )
+    current_provider = ctx.current_provider if current_admission.get("available") else ""
+    current_model = ctx.current_model if current_admission.get("available") else ""
     return {
         "providers": rows,
-        "model": ctx.current_model,
-        "provider": ctx.current_provider,
+        "model": current_model,
+        "provider": current_provider,
     }
 
 
@@ -996,9 +1066,45 @@ def _moa_provider_row(current_provider: str = "") -> dict | None:
     try:
         from hermes_cli.config import load_config
         from hermes_cli.moa_config import normalize_moa_config
+        from hermes_cli.runtime_provider import (
+            current_capability_admission,
+            is_claude_runtime,
+        )
 
-        cfg = normalize_moa_config(load_config().get("moa") or {})
-        models = list(cfg.get("presets", {}).keys())
+        full_cfg = load_config()
+        cfg = normalize_moa_config(full_cfg.get("moa") or {})
+        catalog_cfg = full_cfg.get("model_catalog")
+        catalog_cfg = catalog_cfg if isinstance(catalog_cfg, dict) else {}
+        truth_path = str(catalog_cfg.get("capability_truth_file") or "").strip()
+        try:
+            truth_max_age = max(
+                1, int(catalog_cfg.get("capability_truth_max_age_seconds", 21600))
+            )
+        except (TypeError, ValueError):
+            truth_max_age = 21600
+        claude_admission = current_capability_admission(
+            "anthropic",
+            "claude",
+            truth_path=truth_path,
+            max_age_seconds=truth_max_age,
+        )
+        claude_available = bool(claude_admission.get("available"))
+        models: list[str] = []
+        for name, preset in (cfg.get("presets") or {}).items():
+            slots = list(preset.get("reference_models") or [])
+            aggregator = preset.get("aggregator")
+            if isinstance(aggregator, dict):
+                slots.append(aggregator)
+            contains_claude = any(
+                is_claude_runtime(
+                    str(slot.get("provider") or ""),
+                    str(slot.get("model") or ""),
+                )
+                for slot in slots
+                if isinstance(slot, dict)
+            )
+            if claude_available or not contains_claude:
+                models.append(str(name))
         if not models:
             return None
         return {

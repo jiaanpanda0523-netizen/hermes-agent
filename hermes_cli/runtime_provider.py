@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
+import json
 import logging
 import os
+from pathlib import Path
 import re
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
@@ -71,6 +75,226 @@ def normalize_extra_headers(value):
     """Late-bound delegate — see :func:`load_config` for why."""
     return _config_mod.normalize_extra_headers(value)
 from utils import base_url_host_matches, base_url_hostname, env_int
+
+
+class CurrentCapabilityUnavailable(AuthError):
+    """A configured current-truth snapshot rejects this runtime.
+
+    This is an ``AuthError`` so existing fallback chains can advance to a
+    different provider/model pair, but it stays separately typed for resume
+    and MoA paths that must never reinterpret a policy denial as a transient
+    resolution failure.
+    """
+
+
+_CAPABILITY_TRUTH_DEFAULT_MAX_AGE_SECONDS = 6 * 60 * 60
+_CAPABILITY_TRUTH_CLOCK_SKEW_SECONDS = 300
+
+
+def is_claude_runtime(provider: Optional[str], model: Optional[str]) -> bool:
+    provider_id = str(provider or "").strip().lower()
+    model_id = str(model or "").strip().lower()
+    return (
+        provider_id == "anthropic"
+        or "claude" in provider_id
+        or "claude" in model_id
+    )
+
+
+def _desired_state_sha256(desired_state: dict) -> str:
+    encoded = json.dumps(
+        desired_state,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _parse_capability_truth_timestamp(value: Any) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def _capability_truth_config(
+    config: Optional[dict] = None,
+    *,
+    truth_path: Optional[str] = None,
+    max_age_seconds: Optional[int] = None,
+) -> tuple[str, int]:
+    cfg = config if isinstance(config, dict) else load_config()
+    catalog = cfg.get("model_catalog") if isinstance(cfg, dict) else None
+    catalog = catalog if isinstance(catalog, dict) else {}
+    configured_path = str(
+        truth_path if truth_path is not None else catalog.get("capability_truth_file") or ""
+    ).strip()
+    raw_max_age = (
+        max_age_seconds
+        if max_age_seconds is not None
+        else catalog.get(
+            "capability_truth_max_age_seconds",
+            _CAPABILITY_TRUTH_DEFAULT_MAX_AGE_SECONDS,
+        )
+    )
+    try:
+        parsed_max_age = max(1, int(raw_max_age))
+    except (TypeError, ValueError):
+        parsed_max_age = _CAPABILITY_TRUTH_DEFAULT_MAX_AGE_SECONDS
+    return configured_path, parsed_max_age
+
+
+def current_capability_admission(
+    provider: Optional[str],
+    model: Optional[str],
+    *,
+    config: Optional[dict] = None,
+    truth_path: Optional[str] = None,
+    max_age_seconds: Optional[int] = None,
+    observed_at: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Return current-truth admission for one provider/model identity.
+
+    The integration is opt-in through the existing open ``model_catalog``
+    config block.  When configured, Claude fails closed on missing, malformed,
+    stale, future-dated, or internally inconsistent truth.  Other providers
+    are outside this narrow policy and retain their existing behavior.
+    """
+    if not is_claude_runtime(provider, model):
+        return {"available": True, "reason": "not_claude"}
+
+    configured_path, configured_max_age = _capability_truth_config(
+        config,
+        truth_path=truth_path,
+        max_age_seconds=max_age_seconds,
+    )
+    if not configured_path:
+        return {"available": True, "reason": "capability_truth_not_configured"}
+
+    path = Path(configured_path).expanduser()
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return {"available": False, "reason": "capability_truth_missing"}
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"available": False, "reason": "capability_truth_unreadable"}
+    if not isinstance(payload, dict):
+        return {"available": False, "reason": "capability_truth_unreadable"}
+    if payload.get("schema_version") != "anveros.ai_capability_truth.v1":
+        return {"available": False, "reason": "capability_truth_schema_invalid"}
+
+    generation = payload.get("desired_generation")
+    desired_state = payload.get("desired_state")
+    declared_hash = payload.get("desired_state_sha256")
+    if not isinstance(generation, int) or generation < 1:
+        return {
+            "available": False,
+            "reason": "desired_generation_missing_or_invalid",
+        }
+    if not isinstance(desired_state, dict):
+        return {"available": False, "reason": "desired_state_missing"}
+    if not isinstance(declared_hash, str) or declared_hash != _desired_state_sha256(
+        desired_state
+    ):
+        return {"available": False, "reason": "desired_state_sha256_mismatch"}
+    desired_overrides = desired_state.get("founder_entitlement_overrides")
+    projected_overrides = payload.get("founder_entitlement_overrides")
+    if (
+        isinstance(desired_overrides, dict)
+        and desired_overrides != projected_overrides
+    ):
+        return {
+            "available": False,
+            "reason": "founder_entitlement_projection_mismatch",
+        }
+
+    generated_at = _parse_capability_truth_timestamp(payload.get("generated_at_kst"))
+    if generated_at is None:
+        return {
+            "available": False,
+            "reason": "capability_truth_timestamp_invalid",
+        }
+    now = observed_at or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    age_seconds = (now - generated_at).total_seconds()
+    if age_seconds > configured_max_age:
+        return {"available": False, "reason": "capability_truth_stale"}
+    if age_seconds < -_CAPABILITY_TRUTH_CLOCK_SKEW_SECONDS:
+        return {"available": False, "reason": "capability_truth_from_future"}
+
+    routing = desired_state.get("routing")
+    claude_route = routing.get("claude_code") if isinstance(routing, dict) else None
+    if isinstance(claude_route, dict) and claude_route.get("enabled") is False:
+        return {"available": False, "reason": "entitlement_disabled"}
+    for alias in ("claude", "claude_code"):
+        override = (
+            desired_overrides.get(alias)
+            if isinstance(desired_overrides, dict)
+            else None
+        )
+        if isinstance(override, dict) and str(
+            override.get("state") or ""
+        ).lower() == "disabled":
+            return {"available": False, "reason": "entitlement_disabled"}
+
+    services = payload.get("services")
+    claude_service = next(
+        (
+            service
+            for service in services
+            if isinstance(service, dict)
+            and str(service.get("name") or "").strip().lower() == "claude"
+        ),
+        None,
+    ) if isinstance(services, list) else None
+    if not isinstance(claude_service, dict):
+        return {"available": False, "reason": "claude_capability_missing"}
+    capability = claude_service.get("effective_capability")
+    capability = capability if isinstance(capability, dict) else {}
+    entitlement = str(capability.get("entitlement_state") or "unknown").lower()
+    if entitlement == "disabled":
+        return {"available": False, "reason": "entitlement_disabled"}
+    if claude_service.get("effective_ready") is not True:
+        state = str(claude_service.get("capability_state") or "NOT_READY").lower()
+        return {"available": False, "reason": f"capability_{state}"}
+    return {
+        "available": True,
+        "reason": "effective_capability_ready",
+        "desired_generation": generation,
+    }
+
+
+def enforce_current_capability(
+    provider: Optional[str],
+    model: Optional[str],
+    *,
+    config: Optional[dict] = None,
+    truth_path: Optional[str] = None,
+    max_age_seconds: Optional[int] = None,
+) -> dict[str, Any]:
+    """Raise a typed error when current truth rejects a Claude runtime."""
+    admission = current_capability_admission(
+        provider,
+        model,
+        config=config,
+        truth_path=truth_path,
+        max_age_seconds=max_age_seconds,
+    )
+    if not admission.get("available"):
+        reason = str(admission.get("reason") or "current_capability_unavailable")
+        raise CurrentCapabilityUnavailable(
+            f"Current capability unavailable for {provider or model!r}: {reason}",
+            provider=str(provider or ""),
+            code=reason,
+        )
+    return admission
 
 
 def _getenv(name: str, default: str = "") -> str:
@@ -1904,6 +2128,22 @@ def resolve_runtime_provider(
     # the next provider instead of using a disabled one.
     from hermes_cli.config import is_provider_enabled, load_config
     _full_cfg = load_config()
+    _model_cfg = _full_cfg.get("model") if isinstance(_full_cfg, dict) else None
+    if isinstance(_model_cfg, dict):
+        _current_model = str(
+            target_model
+            or _model_cfg.get("default")
+            or _model_cfg.get("model")
+            or _model_cfg.get("name")
+            or ""
+        ).strip()
+    else:
+        _current_model = str(target_model or _model_cfg or "").strip()
+    enforce_current_capability(
+        requested_provider,
+        _current_model,
+        config=_full_cfg,
+    )
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
     if isinstance(_provs_cfg, dict):
         _block = _provs_cfg.get(requested_provider)

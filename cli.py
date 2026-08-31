@@ -9190,6 +9190,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 stored_provider = None
         model_changed = stored_model != self.model
         provider_changed = bool(stored_provider) and stored_provider != self.provider
+        # Historical session metadata is evidence, not current routing
+        # authority. Check the persisted provider/model before mutating any
+        # live CLI or agent state so a disabled historical Claude route cannot
+        # be resurrected by --resume or /resume.
+        from hermes_cli.runtime_provider import (
+            CurrentCapabilityUnavailable,
+            enforce_current_capability,
+        )
+        try:
+            enforce_current_capability(
+                stored_provider or self.provider,
+                stored_model,
+            )
+        except CurrentCapabilityUnavailable as exc:
+            logger.warning(
+                "Stored session runtime is unavailable in current "
+                "capability truth; keeping ambient runtime: %s",
+                exc,
+            )
+            return
         if not model_changed and not provider_changed:
             return
         self.model = stored_model

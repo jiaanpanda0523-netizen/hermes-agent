@@ -5425,6 +5425,20 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     elif service_tier:
         overrides["service_tier_override"] = service_tier
 
+    # A stored row describes what this conversation used historically; it is
+    # not authority to advertise or rebuild that runtime today. Dropping only
+    # the runtime override preserves the transcript while the normal agent
+    # build adopts the profile's current safe provider/model.
+    from hermes_cli.runtime_provider import current_capability_admission
+
+    admission = current_capability_admission(provider, model)
+    if not admission.get("available"):
+        logger.warning(
+            "Stored session runtime rejected by current capability truth: %s",
+            admission.get("reason"),
+        )
+        return {}
+
     return overrides
 
 

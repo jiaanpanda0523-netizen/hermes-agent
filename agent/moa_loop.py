@@ -365,7 +365,10 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
             return cached
     out: dict[str, Any] = {"provider": provider, "model": model}
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from hermes_cli.runtime_provider import (
+            CurrentCapabilityUnavailable,
+            resolve_runtime_provider,
+        )
 
         rt = resolve_runtime_provider(requested=provider, target_model=model)
         if rt.get("base_url"):
@@ -379,6 +382,11 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
             extra_body = request_overrides.get("extra_body")
             if isinstance(extra_body, dict) and extra_body:
                 out["extra_body"] = dict(extra_body)
+    except CurrentCapabilityUnavailable:
+        # Current policy is not a transient catalog/config failure. Returning
+        # the bare slot here would bypass the shared admission check and call
+        # the disabled provider directly.
+        raise
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("MoA slot runtime resolution failed for %s: %s",
                      _slot_label(slot), exc)

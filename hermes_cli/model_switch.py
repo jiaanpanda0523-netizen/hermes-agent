@@ -1495,7 +1495,10 @@ def switch_model(
         _get_provider_config_dict,
         _same_ollama_native_root,
     )
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import (
+        CurrentCapabilityUnavailable,
+        resolve_runtime_provider,
+    )
 
     resolved_alias = ""
     request_overrides: dict = {}
@@ -1845,6 +1848,23 @@ def switch_model(
         )
         if custom_pdef is not None:
             provider_label = custom_pdef.name
+
+    # Alias resolution, configured-provider detection, and same-provider
+    # switches all converge here. Enforce current capability before any of
+    # their legacy credential fallbacks can reinterpret a policy denial as a
+    # transient resolution error and continue with ambient credentials.
+    try:
+        from hermes_cli.runtime_provider import enforce_current_capability
+
+        enforce_current_capability(target_provider, new_model)
+    except CurrentCapabilityUnavailable as exc:
+        return ModelSwitchResult(
+            success=False,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=str(exc),
+        )
 
     # --- Resolve credentials ---
     api_key = current_api_key
