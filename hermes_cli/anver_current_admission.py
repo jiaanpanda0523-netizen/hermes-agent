@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import subprocess
@@ -12,6 +13,165 @@ from types import ModuleType
 
 class AuthoritySourceUnavailable(RuntimeError):
     pass
+
+
+CAPABILITY_RECOVERY_ROUTES = frozenset(
+    {
+        "current_tool_or_session_recovery",
+        "alternate_authorized_browser_or_computer_use",
+        "connected_app_capability",
+        "provider_or_native_api",
+        "existing_test_or_qa_identity",
+        "alternate_authorized_execution_host",
+        "authorized_runtime_secrets_or_credentials",
+        "safe_retry_or_resume",
+        "another_existing_mature_capability",
+    }
+)
+CAPABILITY_RECOVERY_STATUSES = frozenset(
+    {"available", "recovered", "unavailable", "not_applicable"}
+)
+CAPABILITY_DISPOSITIONS = frozenset(
+    {
+        "AI_EXECUTABLE_NOW",
+        "TECHNICAL_BLOCKER",
+        "ALREADY_DONE",
+        "UNKNOWN_NEEDS_PROBE",
+        "TRUE_HUMAN_ONLY",
+    }
+)
+TRUE_HUMAN_BOUNDARIES = frozenset(
+    {
+        "financial_commitment",
+        "kyc_or_liveness",
+        "legal_signature",
+        "irreversible_production_action",
+        "named_public_final_submission",
+    }
+)
+HUMAN_ESCALATION_FIELDS = frozenset(
+    {
+        "SERVICE",
+        "WHY_HUMAN_ONLY",
+        "ONE_EXACT_ACTION",
+        "EXPECTED_TIME",
+        "WHAT_YOU_WILL_AUTO_CONTINUE_AFTER",
+    }
+)
+
+
+def reason_requests_human_action(reason: object) -> bool:
+    """Detect explicit HUMAN_ONLY/Founder-action prose across block kinds."""
+    if not isinstance(reason, str):
+        return False
+    normalized = " ".join(reason.casefold().replace("_", " ").split())
+    return any(
+        marker in normalized
+        for marker in (
+            "human only",
+            "human-only",
+            "human must",
+            "founder must",
+            "founder needs to",
+            "founder manually",
+            "please founder",
+            "创始人必须",
+            "创始人需要",
+            "创始人手动",
+            "请创始人",
+        )
+    )
+
+
+def validate_human_escalation(
+    capability_recovery: object,
+    human_escalation: object,
+) -> tuple[dict, dict]:
+    """Validate the existing policy before a CURRENT task can surface a human gate.
+
+    The returned recovery projection retains route/status and an evidence digest,
+    not raw evidence that could contain credentials or session material.
+    """
+    if not isinstance(capability_recovery, dict):
+        raise ValueError("capability_recovery_missing")
+    if capability_recovery.get("schema_version") != "anver.capability-recovery.v1":
+        raise ValueError("capability_recovery_invalid_schema")
+    if capability_recovery.get("disposition") not in CAPABILITY_DISPOSITIONS:
+        raise ValueError("capability_recovery_invalid_disposition")
+    trigger = capability_recovery.get("trigger")
+    if not isinstance(trigger, str) or not trigger.strip():
+        raise ValueError("capability_recovery_missing_trigger")
+
+    attempts = capability_recovery.get("attempts")
+    if not isinstance(attempts, list):
+        raise ValueError("capability_recovery_incomplete")
+    projected_attempts: list[dict] = []
+    covered: set[str] = set()
+    available: list[str] = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            raise ValueError("capability_recovery_invalid_attempt")
+        route = attempt.get("capability")
+        status = attempt.get("status")
+        evidence = attempt.get("evidence")
+        if route not in CAPABILITY_RECOVERY_ROUTES or route in covered:
+            raise ValueError("capability_recovery_invalid_attempt")
+        if status not in CAPABILITY_RECOVERY_STATUSES:
+            raise ValueError("capability_recovery_invalid_attempt")
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise ValueError("capability_recovery_missing_evidence")
+        covered.add(route)
+        if status in {"available", "recovered"}:
+            available.append(route)
+        projected_attempts.append(
+            {
+                "capability": route,
+                "status": status,
+                "evidence_sha256": hashlib.sha256(
+                    evidence.strip().encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+    if covered != CAPABILITY_RECOVERY_ROUTES:
+        raise ValueError("capability_recovery_incomplete")
+
+    disposition = capability_recovery["disposition"]
+    if disposition != "TRUE_HUMAN_ONLY":
+        raise ValueError("human_gate_requires_true_human_only")
+    if available:
+        raise ValueError("capability_recovery_found_available_path")
+    boundary = capability_recovery.get("human_boundary")
+    if boundary not in TRUE_HUMAN_BOUNDARIES:
+        raise ValueError("human_boundary_not_irreducible")
+
+    if not isinstance(human_escalation, dict):
+        raise ValueError("human_escalation_missing")
+    if set(human_escalation) != HUMAN_ESCALATION_FIELDS:
+        raise ValueError("human_escalation_invalid_fields")
+    for field in HUMAN_ESCALATION_FIELDS:
+        value = human_escalation.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("human_escalation_invalid_fields")
+    exact_action = human_escalation["ONE_EXACT_ACTION"].strip()
+    if (
+        len(exact_action) > 240
+        or "\n" in exact_action
+        or ";" in exact_action
+        or " and " in exact_action.casefold()
+        or any(token in exact_action for token in ("然后", "并且", "；"))
+    ):
+        raise ValueError("human_escalation_action_not_irreducible")
+
+    return (
+        {
+            "schema_version": "anver.capability-recovery.v1",
+            "trigger": trigger.strip(),
+            "disposition": disposition,
+            "human_boundary": boundary,
+            "attempts": projected_attempts,
+        },
+        {field: human_escalation[field].strip() for field in HUMAN_ESCALATION_FIELDS},
+    )
 
 
 def _current_admission_config() -> dict:

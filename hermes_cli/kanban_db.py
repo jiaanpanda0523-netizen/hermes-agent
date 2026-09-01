@@ -6302,6 +6302,8 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    capability_recovery: Optional[dict] = None,
+    human_escalation: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -6335,6 +6337,51 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if not _admit_anver_current_operation(conn, task_id, operation="block"):
+        return False
+
+    safe_capability_recovery = None
+    safe_human_escalation = None
+    human_block_kinds = {None, "needs_input", "capability"}
+    if _anver_current_admission_required():
+        from hermes_cli.anver_current_admission import (
+            reason_requests_human_action,
+            validate_human_escalation,
+        )
+
+        human_action_requested = reason_requests_human_action(reason)
+        requires_human_admission = (
+            kind in human_block_kinds or human_action_requested
+        )
+    else:
+        human_action_requested = False
+        requires_human_admission = False
+
+    if requires_human_admission:
+
+        try:
+            (
+                safe_capability_recovery,
+                safe_human_escalation,
+            ) = validate_human_escalation(
+                capability_recovery,
+                human_escalation,
+            )
+            if human_action_requested and kind not in human_block_kinds:
+                raise ValueError("human_escalation_kind_mismatch")
+        except ValueError as exc:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "human_escalation_rejected",
+                    {
+                        "operation": "block",
+                        "kind": kind,
+                        "reason": str(exc),
+                    },
+                )
+            raise
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -6452,6 +6499,8 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
+                    "capability_recovery": safe_capability_recovery,
+                    "human_escalation": safe_human_escalation,
                 },
                 run_id=run_id,
             )
@@ -6509,6 +6558,8 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
+                    "capability_recovery": safe_capability_recovery,
+                    "human_escalation": safe_human_escalation,
                 },
                 run_id=run_id,
             )

@@ -865,10 +865,18 @@ def _handle_block(args: dict, **kw) -> str:
                 f"completion judge will evaluate it."
             )
         try:
+            capability_recovery = kb.redact_review_value(
+                args.get("capability_recovery")
+            )
+            human_escalation = kb.redact_review_value(
+                args.get("human_escalation")
+            )
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                capability_recovery=capability_recovery,
+                human_escalation=human_escalation,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1862,9 +1870,14 @@ KANBAN_BLOCK_SCHEMA = {
         "Stop work on this task and route it according to WHY you're stuck. "
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
         "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
-        "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "needed), 'needs_input' (a proven irreducible human boundary), "
+        "'capability' (a proven irreducible human boundary after recovery), "
+        "or 'transient' (a technical failure that may clear). TOOL_PATH_FAILED "
+        "does not mean HUMAN_ONLY. For CURRENT tasks, needs_input, capability, "
+        "and legacy untyped human blocks require a task-bound capability_recovery "
+        "packet covering every existing authorized path; any available/recovered "
+        "path rejects the human gate. A true human gate also requires the exact "
+        "five-field human_escalation packet containing only the irreducible action. "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -1893,6 +1906,108 @@ KANBAN_BLOCK_SCHEMA = {
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
+            },
+            "capability_recovery": {
+                "type": "object",
+                "description": (
+                    "Required by runtime admission before a CURRENT task may "
+                    "use needs_input/capability or an untyped human block. "
+                    "Probe every route for this task. Evidence must describe "
+                    "the actual probe without secrets. TRUE_HUMAN_ONLY is "
+                    "rejected if any route is available or recovered."
+                ),
+                "properties": {
+                    "schema_version": {
+                        "type": "string",
+                        "enum": ["anver.capability-recovery.v1"],
+                    },
+                    "trigger": {"type": "string"},
+                    "disposition": {
+                        "type": "string",
+                        "enum": [
+                            "AI_EXECUTABLE_NOW",
+                            "TECHNICAL_BLOCKER",
+                            "ALREADY_DONE",
+                            "UNKNOWN_NEEDS_PROBE",
+                            "TRUE_HUMAN_ONLY",
+                        ],
+                    },
+                    "human_boundary": {
+                        "type": "string",
+                        "enum": [
+                            "financial_commitment",
+                            "kyc_or_liveness",
+                            "legal_signature",
+                            "irreversible_production_action",
+                            "named_public_final_submission",
+                        ],
+                    },
+                    "attempts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "capability": {
+                                    "type": "string",
+                                    "enum": [
+                                        "current_tool_or_session_recovery",
+                                        "alternate_authorized_browser_or_computer_use",
+                                        "connected_app_capability",
+                                        "provider_or_native_api",
+                                        "existing_test_or_qa_identity",
+                                        "alternate_authorized_execution_host",
+                                        "authorized_runtime_secrets_or_credentials",
+                                        "safe_retry_or_resume",
+                                        "another_existing_mature_capability",
+                                    ],
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": [
+                                        "available",
+                                        "recovered",
+                                        "unavailable",
+                                        "not_applicable",
+                                    ],
+                                },
+                                "evidence": {"type": "string"},
+                            },
+                            "required": ["capability", "status", "evidence"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": [
+                    "schema_version",
+                    "trigger",
+                    "disposition",
+                    "human_boundary",
+                    "attempts",
+                ],
+                "additionalProperties": False,
+            },
+            "human_escalation": {
+                "type": "object",
+                "description": (
+                    "Required only for TRUE_HUMAN_ONLY. Use exactly these "
+                    "fields and put only one irreducible human action in "
+                    "ONE_EXACT_ACTION; automation resumes afterward."
+                ),
+                "properties": {
+                    "SERVICE": {"type": "string"},
+                    "WHY_HUMAN_ONLY": {"type": "string"},
+                    "ONE_EXACT_ACTION": {"type": "string"},
+                    "EXPECTED_TIME": {"type": "string"},
+                    "WHAT_YOU_WILL_AUTO_CONTINUE_AFTER": {"type": "string"},
+                },
+                "required": [
+                    "SERVICE",
+                    "WHY_HUMAN_ONLY",
+                    "ONE_EXACT_ACTION",
+                    "EXPECTED_TIME",
+                    "WHAT_YOU_WILL_AUTO_CONTINUE_AFTER",
+                ],
+                "additionalProperties": False,
             },
             "board": _board_schema_prop(),
         },
