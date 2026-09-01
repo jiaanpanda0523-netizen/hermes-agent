@@ -104,6 +104,65 @@ def compressor_128k():
 
 class TestProtectedTailPressure61932:
 
+    def test_resumed_handoff_does_not_anchor_an_autonomous_tool_run_forever(
+        self, compressor_128k
+    ):
+        """A resumed summary plus a long tool-only run must stay compactable.
+
+        Production shape: the resumed handoff is the first active row, the
+        latest real user ask is followed by hundreds of assistant(tool_calls)
+        / tool(result) rows, and no later assistant prose bubble exists.  The
+        user + visible-assistant tail anchors used to pull the cut back to
+        index 1.  The handoff then consumed the entire one-row middle and every
+        pass returned ``empty_post_handoff_window``; deterministic tool-body
+        pruning helped once, but the remaining call metadata stayed above the
+        compression threshold forever.
+        """
+        c = compressor_128k
+        c.threshold_tokens_cap = 80_000
+        c._apply_threshold_tokens_cap()
+        c._generate_summary = lambda turns, **_kwargs: c._augment_summary_lean(
+            c._with_summary_prefix("## Active Task\nSynthetic checkpoint."),
+            turns,
+        )
+        active_ask = "Continue the investigation and finish it."
+        msgs: list[dict] = [
+            {
+                "role": "user",
+                "content": c._with_summary_prefix(
+                    "## Active Task\nPrior investigation checkpoint."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Visible reply before the autonomous tool run.",
+            },
+            {"role": "user", "content": active_ask},
+        ]
+        # Keep enough already-demotable tool metadata that the protected tail
+        # remains above the 80K trigger even after Phase-1 body pruning.  A
+        # smaller fixture falls below the trigger and is no longer a dead-end.
+        for i in range(1_400):
+            msgs.extend(_unique_tool_pair(i, 900))
+
+        before = estimate_messages_tokens_rough(msgs)
+        assert before > c.context_length
+
+        out = c.compress(list(msgs), current_tokens=before, force=True)
+        after = estimate_messages_tokens_rough(out)
+
+        assert c._last_compression_made_progress is True
+        assert (c._last_compression_telemetry or {}).get("failure_class") != (
+            "empty_post_handoff_window"
+        )
+        assert after < c.threshold_tokens, (
+            f"autonomous tool tail stayed armed for another pass: "
+            f"{before:,} -> {after:,} >= {c.threshold_tokens:,}"
+        )
+        assert any(
+            active_ask in str(message.get("content") or "") for message in out
+        ), "the latest real user ask must survive verbatim in the lean summary"
+
 
 
     def test_compress_escapes_cannot_compress_further_dead_end(
@@ -203,4 +262,3 @@ class TestProtectedTailPressure61932:
             assert rid in call_ids, f"orphaned tool result {rid!r}"
         for cid in call_ids:
             assert cid in tool_result_ids, f"orphaned tool call {cid!r}"
-

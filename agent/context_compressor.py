@@ -6817,6 +6817,15 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
+        # Keep the token-budget boundary before recency anchors expand the
+        # tail.  In a resumed autonomous run the newest real user message and
+        # newest prose assistant reply can both be hundreds of tool calls old;
+        # anchoring either one then protects the entire tool run and leaves no
+        # compressible middle.  Lean summaries already preserve real user
+        # messages verbatim and keep a session_search recovery pointer, so an
+        # over-threshold anchored tail may safely fall back to this coherent
+        # tool-pair boundary instead of retrying an impossible no-op forever.
+        budget_cut_idx = cut_idx
 
         # Ensure the most recent user message is always in the tail so the
         # active task is never lost to compression (fixes #10896).
@@ -6848,6 +6857,33 @@ This compaction should PRIORITISE preserving all information related to the focu
             cut_idx = self._ensure_last_n_user_messages_in_tail(
                 messages, cut_idx, head_end, _min_tail_users,
             )
+
+        if (
+            getattr(self, "tail_mode", "lean") == "lean"
+            and budget_cut_idx > cut_idx
+        ):
+            anchored_tail_tokens = sum(
+                _estimate_msg_budget_tokens(
+                    message,
+                    charge_stale_thinking=(
+                        _charge_all_thinking or idx == _newest_asst_idx
+                    ),
+                )
+                for idx, message in enumerate(
+                    messages[cut_idx:], start=cut_idx
+                )
+            )
+            if anchored_tail_tokens >= self.threshold_tokens:
+                if not self.quiet_mode:
+                    logger.warning(
+                        "Tail anchors protect ~%d tokens (threshold %d); "
+                        "using lean recovery boundary %d instead of %d",
+                        anchored_tail_tokens,
+                        self.threshold_tokens,
+                        budget_cut_idx,
+                        cut_idx,
+                    )
+                cut_idx = budget_cut_idx
 
         # The floor guarantees forward progress — compression must always claim
         # at least one message or the caller's compress_start >= compress_end
