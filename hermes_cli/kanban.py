@@ -434,9 +434,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
-                          help="Initial card status. Use 'blocked' for cards "
-                               "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                          help="Initial card status. Under required CURRENT "
+                               "admission, CLI blocked creation is fail-closed; "
+                               "use the governed Kanban tool with structured "
+                               "capability recovery for a true human boundary.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1662,6 +1663,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if (
+        getattr(args, "initial_status", "running") == "blocked"
+        and kb._anver_current_admission_required()
+    ):
+        print(
+            "kanban: CURRENT blocked creation requires the structured "
+            "capability_recovery and human_escalation admission available "
+            "through the governed kanban tool; CLI blocked creation is "
+            "fail-closed.",
+            file=sys.stderr,
+        )
+        return 1
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,

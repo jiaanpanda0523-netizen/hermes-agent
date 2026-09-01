@@ -114,9 +114,7 @@ def _unbound_stale_task(conn) -> str:
         body="Re-open old exact head 242eee without a CURRENT contract binding.",
         assignee="auditor",
         workspace_kind="scratch",
-        initial_status="blocked",
     )
-    assert kb.unblock_task(conn, task_id)
     return task_id
 
 
@@ -180,9 +178,7 @@ def test_required_current_admission_rejects_malformed_current_contract(
             title="malformed current task",
             body=body,
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, task_id)
 
         assert kb.claim_task(conn, task_id) is None
         rejection = [
@@ -217,9 +213,7 @@ def test_required_current_admission_fails_closed_when_authority_source_is_unavai
             title="authority missing",
             body=body,
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, task_id)
 
         assert kb.claim_task(conn, task_id) is None
         rejection = [
@@ -245,9 +239,7 @@ def test_required_current_admission_allows_a_valid_bound_task(
             title="CURRENT bounded task",
             body=_bound_body(_contract(2, "c" * 64)),
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, task_id)
 
         claimed = kb.claim_task(conn, task_id, claimer="current-writer")
         assert claimed is not None
@@ -268,9 +260,7 @@ def test_tool_path_failure_cannot_be_promoted_to_founder_human_only(
             title="Forst Market browser recovery regression",
             body=_bound_body(_contract(1, "4" * 64)),
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, task_id)
         claimed = kb.claim_task(conn, task_id, claimer="current-writer")
         assert claimed is not None
 
@@ -313,9 +303,7 @@ def test_available_qa_identity_path_cannot_be_promoted_to_founder_human_only(
             title="Forst Chat QA identity recovery regression",
             body=_bound_body(_contract(1, "5" * 64)),
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, task_id)
         claimed = kb.claim_task(conn, task_id, claimer="current-writer")
         assert claimed is not None
 
@@ -350,9 +338,7 @@ def test_irreducible_human_action_is_admitted_after_complete_recovery(
             title="irreducible legal signature canary",
             body=_bound_body(_contract(1, "6" * 64)),
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, task_id)
         claimed = kb.claim_task(conn, task_id, claimer="current-writer")
         assert claimed is not None
 
@@ -392,9 +378,7 @@ def test_real_kanban_tool_surface_rejects_unrecovered_founder_escalation(
             title="dispatcher human escalation regression",
             body=_bound_body(_contract(1, "7" * 64)),
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, task_id)
         claimed = kb.claim_task(conn, task_id, claimer="current-writer")
         assert claimed is not None
         run_id = claimed.current_run_id
@@ -500,6 +484,72 @@ def test_real_kanban_create_surface_rejects_direct_human_block(
         assert event.payload["capability_recovery"]["disposition"] == "TRUE_HUMAN_ONLY"
 
 
+def test_core_create_rejects_unrecovered_current_human_block(
+    tmp_path: Path, monkeypatch,
+):
+    """Direct Python callers cannot bypass the tool-level create admission."""
+    root, sha = _authority_repo(tmp_path)
+    monkeypatch.setenv("ANVER_CURRENT_ADMISSION_MODE", "required")
+    monkeypatch.setenv("ANVER_CURRENT_AUTHORITY_ROOT", str(root))
+    monkeypatch.setenv("ANVER_CURRENT_AUTHORITY_SHA", sha)
+    db_path = tmp_path / "kanban.db"
+    with kb.connect(db_path) as conn:
+        with pytest.raises(ValueError, match="capability_recovery_missing"):
+            kb.create_task(
+                conn,
+                title="core blocked bypass",
+                body=_bound_body(_contract(1, "9" * 64)),
+                assignee="writer",
+                initial_status="blocked",
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = ?",
+            ("core blocked bypass",),
+        ).fetchone()[0] == 0
+
+
+def test_cli_create_rejects_current_human_block_with_zero_rows(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    """The live Hermes CLI has no unstructured blocked-create escape path."""
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+
+    root, sha = _authority_repo(tmp_path)
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("ANVER_CURRENT_ADMISSION_MODE", "required")
+    monkeypatch.setenv("ANVER_CURRENT_AUTHORITY_ROOT", str(root))
+    monkeypatch.setenv("ANVER_CURRENT_AUTHORITY_SHA", sha)
+    with kb.connect(db_path):
+        pass
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    subparsers = parser.add_subparsers(dest="command")
+    kanban_cli.build_parser(subparsers)
+    args = parser.parse_args(
+        [
+            "kanban",
+            "create",
+            "CLI blocked bypass",
+            "--body",
+            _bound_body(_contract(1, "a" * 64)),
+            "--assignee",
+            "writer",
+            "--initial-status",
+            "blocked",
+        ]
+    )
+
+    assert kanban_cli.kanban_command(args) == 1
+    assert "CLI blocked creation is fail-closed" in capsys.readouterr().err
+    with kb.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = ?",
+            ("CLI blocked bypass",),
+        ).fetchone()[0] == 0
+
+
 def test_required_current_admission_rejects_a_superseded_bound_task(
     tmp_path: Path, monkeypatch,
 ):
@@ -513,17 +563,13 @@ def test_required_current_admission_rejects_a_superseded_bound_task(
             title="superseded task",
             body=_bound_body(_contract(1, "1" * 64)),
             assignee="writer",
-            initial_status="blocked",
         )
         current_id = kb.create_task(
             conn,
             title="current task",
             body=_bound_body(_contract(2, "2" * 64)),
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, stale_id)
-        assert kb.unblock_task(conn, current_id)
 
         assert kb.claim_task(conn, stale_id) is None
         rejection = [
@@ -552,9 +598,7 @@ def test_required_current_admission_rejects_writer_when_contract_is_read_only(
             title="read-only challenge writer",
             body=_bound_body(contract),
             assignee="writer",
-            initial_status="blocked",
         )
-        assert kb.unblock_task(conn, task_id)
 
         assert kb.claim_task(conn, task_id) is None
         rejection = [

@@ -3190,6 +3190,8 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
+    capability_recovery: Optional[dict] = None,
+    human_escalation: Optional[dict] = None,
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
@@ -3245,6 +3247,30 @@ def create_task(
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
+        )
+    safe_capability_recovery = None
+    safe_human_escalation = None
+    if initial_status == "blocked" and _anver_current_admission_required():
+        from hermes_cli.anver_current_admission import (
+            current_admission_rejection,
+            validate_human_escalation,
+        )
+
+        current_rejection = current_admission_rejection(
+            body,
+            authority_bodies=[
+                row["body"]
+                for row in conn.execute("SELECT body FROM tasks").fetchall()
+            ] + [body],
+        )
+        if current_rejection is not None:
+            raise ValueError(f"current_admission_rejected:{current_rejection}")
+        (
+            safe_capability_recovery,
+            safe_human_escalation,
+        ) = validate_human_escalation(
+            redact_review_value(capability_recovery),
+            redact_review_value(human_escalation),
         )
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
@@ -3563,8 +3589,21 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "capability_recovery": safe_capability_recovery,
+                        "human_escalation": safe_human_escalation,
                     },
                 )
+                if safe_capability_recovery is not None:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "human_escalation_admitted",
+                        {
+                            "operation": "create_blocked",
+                            "capability_recovery": safe_capability_recovery,
+                            "human_escalation": safe_human_escalation,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:

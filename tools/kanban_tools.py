@@ -1431,36 +1431,6 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            safe_capability_recovery = None
-            safe_human_escalation = None
-            if (
-                str(initial_status) == "blocked"
-                and kb._anver_current_admission_required()
-            ):
-                from hermes_cli.anver_current_admission import (
-                    current_admission_rejection,
-                    validate_human_escalation,
-                )
-
-                current_rejection = current_admission_rejection(
-                    body,
-                    authority_bodies=[
-                        row["body"]
-                        for row in conn.execute("SELECT body FROM tasks").fetchall()
-                    ] + [body],
-                )
-                if current_rejection is not None:
-                    raise ValueError(
-                        f"current_admission_rejected:{current_rejection}"
-                    )
-                (
-                    safe_capability_recovery,
-                    safe_human_escalation,
-                ) = validate_human_escalation(
-                    kb.redact_review_value(args.get("capability_recovery")),
-                    kb.redact_review_value(args.get("human_escalation")),
-                )
-
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
@@ -1497,21 +1467,15 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                capability_recovery=kb.redact_review_value(
+                    args.get("capability_recovery")
+                ),
+                human_escalation=kb.redact_review_value(
+                    args.get("human_escalation")
+                ),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
-            if safe_capability_recovery is not None:
-                with kb.write_txn(conn):
-                    kb._append_event(
-                        conn,
-                        new_tid,
-                        "human_escalation_admitted",
-                        {
-                            "operation": "create_blocked",
-                            "capability_recovery": safe_capability_recovery,
-                            "human_escalation": safe_human_escalation,
-                        },
-                    )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
