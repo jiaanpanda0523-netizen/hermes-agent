@@ -266,6 +266,73 @@ class TestProtectedTailPressure61932:
         assert set(replies) <= ordinary_assistants
         assert estimate_messages_tokens_rough(out) < c.threshold_tokens
 
+    def test_tool_call_prose_anchor_is_normalized_before_role_selection(
+        self, compressor_128k
+    ):
+        """A prose assistant anchor must not change visibility after assembly.
+
+        The assistant originally owns a completed tool call.  Lean recovery
+        reinserts its visible prose but summarizes the paired tool result.  If
+        role selection runs before the orphaned call is stripped, the strict
+        template sees a different role sequence after sanitization.
+        """
+        c = compressor_128k
+        c.threshold_tokens_cap = 80_000
+        c._apply_threshold_tokens_cap()
+        c._generate_summary = lambda turns, **_kwargs: c._augment_summary_lean(
+            c._with_summary_prefix("## Active Task\nSynthetic checkpoint."),
+            turns,
+        )
+        msgs: list[dict] = [
+            {
+                "role": "user",
+                "content": c._with_summary_prefix(
+                    "## Active Task\nPrior investigation checkpoint."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Visible reply that also launched a tool.",
+                "tool_calls": [
+                    {
+                        "id": "anchor_call",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+                "api_content": "stale replay bytes",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "anchor_call",
+                "content": "completed anchor result",
+            },
+            {"role": "user", "content": "Keep investigating."},
+        ]
+        for i in range(1_400):
+            msgs.extend(_unique_tool_pair(i, 900))
+
+        before = estimate_messages_tokens_rough(msgs)
+        out = c.compress(list(msgs), current_tokens=before, force=True)
+
+        visible = [
+            m.get("role")
+            for m in out
+            if m.get("role") != "tool"
+            and not (m.get("role") == "assistant" and m.get("tool_calls"))
+        ]
+        assert visible
+        assert visible[0] == "user"
+        assert all(left != right for left, right in zip(visible, visible[1:]))
+        anchor = next(
+            m
+            for m in out
+            if m.get("content") == "Visible reply that also launched a tool."
+        )
+        assert anchor.get("role") == "assistant"
+        assert "tool_calls" not in anchor
+        assert "api_content" not in anchor
+
 
 
     def test_compress_escapes_cannot_compress_further_dead_end(

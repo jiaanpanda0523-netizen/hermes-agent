@@ -300,6 +300,11 @@ _DB_PERSISTED_MARKER = "_db_persisted"
 # duplicating their live copies (#86366). Never persisted: _insert_message_rows
 # only reads known columns.
 _COMPACTION_TAIL_MARKER = "_compaction_tail"
+# Exact durable identity for a non-contiguous recency anchor reinserted by the
+# lean tool-tail escape.  Unlike the true carried-forward suffix, these rows
+# cannot be represented by ``tail_count`` without rewind-stamping unrelated
+# originals.  The commit layer consumes and removes this marker before insert.
+_COMPACTION_SOURCE_ROW_ID_MARKER = "_compaction_source_row_id"
 PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
@@ -8334,6 +8339,36 @@ This compaction should PRIORITISE preserving all information related to the focu
             msg = _fresh_compaction_message_copy(messages[i])
             stripped = self._strip_context_summary_handoff_message(msg)
             if stripped is not None:
+                # A visible assistant anchor can also own tool_calls in the
+                # source transcript.  Its matching tool result stays in the
+                # summarized interval, so preserving the call metadata here
+                # would make this row template-invisible during role selection;
+                # the terminal sanitizer would then strip the orphan and turn
+                # it visible *after* roles were chosen.  Normalize first so the
+                # sequence used to select the summary role is the sequence sent
+                # to the provider.  The summary/recovery archive retains the
+                # original call and result.
+                if (
+                    stripped.get("role") == "assistant"
+                    and stripped.get("tool_calls")
+                    and _content_text_for_contains(stripped.get("content")).strip()
+                ):
+                    stripped.pop("tool_calls", None)
+                    stripped.pop("function_call", None)
+                    for replay_key in (
+                        "reasoning",
+                        "reasoning_content",
+                        "reasoning_details",
+                        "codex_reasoning_items",
+                        "codex_message_items",
+                    ):
+                        stripped.pop(replay_key, None)
+                    drop_stale_api_content(stripped)
+                source_row_id = messages[i].get("_row_id")
+                if isinstance(source_row_id, int) and not isinstance(
+                    source_row_id, bool
+                ):
+                    stripped[_COMPACTION_SOURCE_ROW_ID_MARKER] = source_row_id
                 tail_messages.append(stripped)
         # Start at tail_start (not compress_end): the restart-decay scan may
         # have advanced it past a summary that sat beyond compress_end
@@ -8348,6 +8383,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             msg = _fresh_compaction_message_copy(messages[i])
             stripped = self._strip_context_summary_handoff_message(msg)
             if stripped is not None:
+                stripped[_COMPACTION_TAIL_MARKER] = True
                 tail_messages.append(stripped)
 
         _merge_summary_into_tail = False
@@ -8513,11 +8549,6 @@ This compaction should PRIORITISE preserving all information related to the focu
         if _force_user_leading and first_tail_visible_idx is not None:
             _merge_target_idx = first_tail_visible_idx
         for tail_idx, msg in enumerate(tail_messages):
-            # Tag the carried-forward tail so archive_and_compact() can
-            # classify these rows' originals as superseded-duplicate
-            # (rewind semantics) instead of "summarized away" (#86366).
-            if isinstance(msg, dict):
-                msg[_COMPACTION_TAIL_MARKER] = True
             if _merge_summary_into_tail and tail_idx == _merge_target_idx:
                 # Merge the summary into the tail message that collided.
                 old_content = msg.get("content", "")
@@ -8562,6 +8593,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # previously sent) is stale; drop it so replay can't resend
                 # the pre-merge bytes without the summary.
                 drop_stale_api_content(msg)
+                # This carrier is no longer a byte-identical clone of its
+                # source row, so the old original remains real compacted
+                # history rather than a superseded duplicate.
+                msg.pop(_COMPACTION_TAIL_MARKER, None)
+                msg.pop(_COMPACTION_SOURCE_ROW_ID_MARKER, None)
                 _merge_summary_into_tail = False
             compressed.append(msg)
 

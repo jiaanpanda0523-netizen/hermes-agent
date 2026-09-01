@@ -79,6 +79,42 @@ def _rows(db: SessionDB):
 
 
 class TestTailCountArchivesAsRewindSemantics:
+    def test_non_contiguous_anchor_uses_exact_source_row_identity(
+        self, db: SessionDB
+    ) -> None:
+        """Lean recovery anchors are not part of the contiguous suffix.
+
+        Exact source ids must rewind the old anchor while tail_count continues
+        to describe only the true final suffix.
+        """
+        _seed(db)
+        physical = db.get_messages_as_conversation("sess1", include_row_ids=True)
+        anchor_id = physical[1]["_row_id"]
+        compacted = [
+            *SUMMARY,
+            {"role": "assistant", "content": "turn 1"},
+            {"role": "user", "content": "turn 4"},
+            {"role": "assistant", "content": "turn 5"},
+        ]
+
+        db.archive_and_compact(
+            "sess1",
+            compacted,
+            tail_count=2,
+            rewind_source_row_ids=[anchor_id],
+        )
+
+        rows = _rows(db)
+        for content in ("turn 1", "turn 4", "turn 5"):
+            originals = [
+                row for row in rows
+                if row["content"] == content and row["active"] == 0
+            ]
+            assert len(originals) == 1
+            assert originals[0]["compacted"] == 0
+        turn3 = [row for row in rows if row["content"] == "turn 3"]
+        assert turn3 and turn3[0]["compacted"] == 1
+
     def test_tail_originals_hidden_from_recall(self, db: SessionDB) -> None:
         """tail_count>0: the tail's original rows must NOT come back from
         session_search alongside their live clones (#86366)."""

@@ -211,6 +211,35 @@ class TestResolveContextCompressionTimeouts:
         assert idle == 90.0
         assert ceiling == 600.0
 
+    def test_managed_timeout_presence_preserves_administrator_disable(self):
+        """Managed leaf overrides are explicit even when the user file is empty."""
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "compression": {
+                        "context_timeout_seconds": 0,
+                        "context_total_ceiling_seconds": 600,
+                    }
+                },
+            ),
+            patch("hermes_cli.config.read_raw_config_readonly", return_value={}),
+            patch(
+                "hermes_cli.managed_scope.load_managed_config",
+                return_value={
+                    "compression": {"context_timeout_seconds": 0}
+                },
+            ),
+            patch(
+                "agent.auxiliary_client._effective_aux_timeout",
+                return_value=300,
+            ),
+        ):
+            idle, ceiling = resolve_context_compression_timeouts()
+
+        assert idle == 0.0
+        assert ceiling == 600.0
+
 
 class TestRunCompressContextWithProgressTimeout:
     def test_deadline_before_worker_start_uses_timeout_fallback(self, monkeypatch):

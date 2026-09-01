@@ -12498,6 +12498,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
         tail_count: int = 0,
+        rewind_source_row_ids: Optional[List[int]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -12548,6 +12549,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         filter alongside their live clones and session_search returns every
         carried-forward message once per compaction. Callers that cannot know
         their tail shape keep the historical archive-everything behavior.
+
+        *rewind_source_row_ids* names exact active originals for verbatim rows
+        reinserted from outside that contiguous suffix.  Lean recovery uses it
+        for recency anchors; treating those rows as part of *tail_count* would
+        rewind-stamp unrelated final rows and leave the true anchor searchable
+        twice.  Unknown, inactive, cross-session, and post-watermark ids are
+        ignored by the session-scoped update below.
 
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
@@ -12641,7 +12649,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # as live rows — their originals are the SAME superseded-duplicate
             # class as the carried-forward tail (#86366), so they take the
             # rewind flags too instead of double-matching the recall filter.
-            rewind_ids = [*(rewind_tail_ids or []), *tail_ids]
+            exact_rewind_ids: list[int] = []
+            for candidate in rewind_source_row_ids or []:
+                if isinstance(candidate, int) and not isinstance(candidate, bool):
+                    if watermark is None or candidate <= int(watermark):
+                        exact_rewind_ids.append(candidate)
+            rewind_ids = list(
+                dict.fromkeys(
+                    [*(rewind_tail_ids or []), *exact_rewind_ids, *tail_ids]
+                )
+            )
 
             if rewind_ids:
                 placeholders = ",".join("?" for _ in rewind_ids)

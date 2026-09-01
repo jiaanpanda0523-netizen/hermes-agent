@@ -1105,6 +1105,7 @@ def resolve_context_compression_timeouts(
     if cfg is None:
         try:
             from hermes_cli.config import load_config, read_raw_config_readonly
+            from hermes_cli.managed_scope import load_managed_config
 
             raw = load_config()
             maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
@@ -1122,6 +1123,16 @@ def resolve_context_compression_timeouts(
             explicit_idle = bool(
                 isinstance(raw_compression, dict)
                 and "context_timeout_seconds" in raw_compression
+            )
+            managed = load_managed_config()
+            managed_compression = (
+                managed.get("compression", {})
+                if isinstance(managed, dict)
+                else {}
+            )
+            explicit_idle = explicit_idle or bool(
+                isinstance(managed_compression, dict)
+                and "context_timeout_seconds" in managed_compression
             )
         except Exception:
             cfg = {}
@@ -4598,11 +4609,18 @@ def compress_context(
                 # Remember the tagged dicts by identity — the salvage pass
                 # below may swap `compressed` for a subset, and tail_count
                 # must describe the FINAL committed list.
-                _tail_tagged_ids = {
-                    id(m)
-                    for m in compressed
-                    if isinstance(m, dict) and m.pop("_compaction_tail", None)
-                }
+                _tail_tagged_ids = set()
+                _anchor_source_row_ids_by_object: dict[int, int] = {}
+                for m in compressed:
+                    if not isinstance(m, dict):
+                        continue
+                    if m.pop("_compaction_tail", None):
+                        _tail_tagged_ids.add(id(m))
+                    source_row_id = m.pop("_compaction_source_row_id", None)
+                    if isinstance(source_row_id, int) and not isinstance(
+                        source_row_id, bool
+                    ):
+                        _anchor_source_row_ids_by_object[id(m)] = source_row_id
 
                 # Anti-growth guard at the COMMIT SITE: never persist a
                 # compression that makes the transcript larger (observed:
@@ -4745,6 +4763,11 @@ def compress_context(
                     _tail_count = sum(
                         1 for m in compressed if id(m) in _tail_tagged_ids
                     )
+                    _rewind_source_row_ids = [
+                        _anchor_source_row_ids_by_object[id(m)]
+                        for m in compressed
+                        if id(m) in _anchor_source_row_ids_by_object
+                    ]
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
@@ -4754,6 +4777,7 @@ def compress_context(
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
                         tail_count=_tail_count,
+                        rewind_source_row_ids=_rewind_source_row_ids,
                     )
                     split_status = "in_place_committed"
                     # Post-commit contract (#98450, mirrors
