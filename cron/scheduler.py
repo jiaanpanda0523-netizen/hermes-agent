@@ -5601,8 +5601,40 @@ def run_job(
     if current_admission_required():
         stored_prompt = str(job.get("prompt") or "")
         from hermes_cli.anver_current_admission import current_admission_rejection
+        from hermes_cli.kanban_db import connect_closing
 
-        rejection = current_admission_rejection(stored_prompt)
+        # Supersession is a property of the full live authority set, not of a
+        # contract in isolation.  Compare the firing cron prompt against every
+        # preserved cron definition and native Kanban task body.  This reuses
+        # the same CURRENT validator as native claim/complete and ensures an
+        # old, still-scheduled V1 cannot revive after V2 became CURRENT.
+        try:
+            from cron.jobs import load_jobs
+
+            authority_bodies = []
+            seen_bodies = set()
+            for candidate in [
+                stored_prompt,
+                *(str(item.get("prompt") or "") for item in load_jobs()),
+            ]:
+                if candidate and candidate not in seen_bodies:
+                    authority_bodies.append(candidate)
+                    seen_bodies.add(candidate)
+            with connect_closing() as conn:
+                for row in conn.execute("SELECT body FROM tasks").fetchall():
+                    candidate = str(row["body"] or "")
+                    if candidate and candidate not in seen_bodies:
+                        authority_bodies.append(candidate)
+                        seen_bodies.add(candidate)
+            rejection = current_admission_rejection(
+                stored_prompt,
+                authority_bodies=authority_bodies,
+            )
+        except Exception:
+            logger.exception(
+                "Job '%s': CURRENT authority set could not be loaded", job_id
+            )
+            rejection = "authority_source_unavailable"
         if rejection is not None:
             reason = {
                 "missing_current_contract_binding": "FAIL_CLOSED_MISSING_CURRENT_CONTRACT",
