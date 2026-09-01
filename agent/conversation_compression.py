@@ -1089,6 +1089,8 @@ def _get_compress_timeout_executor():
 
 def resolve_context_compression_timeouts(
     compression_cfg: Optional[dict] = None,
+    *,
+    auxiliary_timeout_seconds: Optional[float] = None,
 ) -> Tuple[float, float]:
     """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
 
@@ -1108,6 +1110,16 @@ def resolve_context_compression_timeouts(
             cfg = maybe if isinstance(maybe, dict) else {}
         except Exception:
             cfg = {}
+    if auxiliary_timeout_seconds is None and compression_cfg is None:
+        try:
+            from agent.auxiliary_client import _effective_aux_timeout
+
+            auxiliary_timeout_seconds = _effective_aux_timeout(
+                "compression", None
+            )
+        except Exception:
+            auxiliary_timeout_seconds = None
+    explicit_idle = False
     if isinstance(cfg, dict):
         raw_idle = cfg.get("context_timeout_seconds")
         if raw_idle is not None:
@@ -1115,6 +1127,7 @@ def resolve_context_compression_timeouts(
                 parsed = float(raw_idle)
                 # Explicit 0/negative disables; positive values win.
                 idle = parsed
+                explicit_idle = True
             except (TypeError, ValueError):
                 pass
         raw_ceiling = cfg.get("context_total_ceiling_seconds")
@@ -1125,6 +1138,13 @@ def resolve_context_compression_timeouts(
                     ceiling = parsed
             except (TypeError, ValueError):
                 pass
+    if not explicit_idle and auxiliary_timeout_seconds is not None:
+        try:
+            parsed_aux_timeout = float(auxiliary_timeout_seconds)
+            if parsed_aux_timeout > 0:
+                idle = max(idle, parsed_aux_timeout)
+        except (TypeError, ValueError):
+            pass
     if idle > 0:
         ceiling = max(ceiling, idle)
     return idle, ceiling

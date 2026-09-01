@@ -146,6 +146,21 @@ class TestResolveContextCompressionTimeouts:
         assert idle == 90.0
         assert ceiling == 90.0
 
+    def test_implicit_host_idle_cannot_expire_before_auxiliary_deadline(self):
+        idle, ceiling = resolve_context_compression_timeouts(
+            {}, auxiliary_timeout_seconds=300
+        )
+        assert idle == 300.0
+        assert ceiling == 600.0
+
+    def test_explicit_host_idle_keeps_operator_override(self):
+        idle, ceiling = resolve_context_compression_timeouts(
+            {"context_timeout_seconds": 90},
+            auxiliary_timeout_seconds=300,
+        )
+        assert idle == 90.0
+        assert ceiling == 600.0
+
 
 class TestRunCompressContextWithProgressTimeout:
     def test_deadline_before_worker_start_uses_timeout_fallback(self, monkeypatch):
