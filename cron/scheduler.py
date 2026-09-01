@@ -7344,7 +7344,19 @@ def _run_one_job_body(
             drift_skip = drift_skip_silent or (
                 bool(error) and DRIFT_SKIP_MARKER in str(error)
             )
-            if blocked_config and not success:
+            # CURRENT admission rejections are terminal ledger evidence, not
+            # chat content.  Delivering them to ``bot-chat`` would resume the
+            # very historical session that the gate rejected, creating an
+            # authority bypass after the protected agent path had correctly
+            # failed closed.
+            current_admission_blocked = (
+                not success
+                and isinstance(error, str)
+                and error.startswith("FAIL_CLOSED_")
+            )
+            if current_admission_blocked:
+                deliver_content = ""
+            elif blocked_config and not success:
                 # Blocked-config alert: bypass the generic failure summarizer
                 # (whose auth/timeout heuristics would mislabel this as a
                 # provider runtime failure) — say plainly that config
@@ -7400,7 +7412,7 @@ def _run_one_job_body(
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
-            if blocked_config_silent or drift_skip_silent:
+            if current_admission_blocked or blocked_config_silent or drift_skip_silent:
                 should_deliver = False
             unresolved_origin = False
             # Cron silence suppression — see _is_cron_silence_response.  Replaces the
