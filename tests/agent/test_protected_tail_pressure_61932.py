@@ -162,6 +162,109 @@ class TestProtectedTailPressure61932:
         assert any(
             active_ask in str(message.get("content") or "") for message in out
         ), "the latest real user ask must survive verbatim in the lean summary"
+        assert any(
+            message.get("role") == "user"
+            and message.get("content") == active_ask
+            and not message.get("_compressed_summary")
+            for message in out
+        ), "the active ask must remain an ordinary recency-anchor row"
+        assert any(
+            message.get("role") == "assistant"
+            and message.get("content")
+            == "Visible reply before the autonomous tool run."
+            and not message.get("_compressed_summary")
+            for message in out
+        ), "the last visible assistant reply must remain an ordinary row"
+
+    def test_schema_pressure_activates_lean_tool_tail_escape(self, compressor_128k):
+        """Full-request pressure includes schemas/system prompt, not messages only."""
+        c = compressor_128k
+        c.threshold_tokens_cap = 80_000
+        c._apply_threshold_tokens_cap()
+        c._generate_summary = lambda turns, **_kwargs: c._augment_summary_lean(
+            c._with_summary_prefix("## Active Task\nSynthetic checkpoint."),
+            turns,
+        )
+        msgs: list[dict] = [
+            {
+                "role": "user",
+                "content": c._with_summary_prefix(
+                    "## Active Task\nPrior investigation checkpoint."
+                ),
+            },
+            {"role": "assistant", "content": "Visible reply."},
+            {"role": "user", "content": "Keep investigating."},
+        ]
+        for i in range(1_100):
+            msgs.extend(_unique_tool_pair(i, 900))
+
+        before = estimate_messages_tokens_rough(msgs)
+        out = c.compress(
+            list(msgs),
+            # 20K represents system prompt + tool schemas.  Phase-1 pruning
+            # leaves the anchored message tail just below 80K; request-wide
+            # pressure must still activate the escape.
+            current_tokens=before + 20_000,
+            force=True,
+        )
+        after = estimate_messages_tokens_rough(out)
+
+        assert c._last_compression_made_progress is True
+        assert after < c.threshold_tokens
+        assert any(
+            m.get("role") == "user" and m.get("content") == "Keep investigating."
+            for m in out
+        )
+
+    def test_opt_in_n_user_anchors_survive_tool_tail_escape(self, compressor_128k):
+        c = compressor_128k
+        c.threshold_tokens_cap = 80_000
+        c._apply_threshold_tokens_cap()
+        c.min_tail_user_messages = 3
+        c._generate_summary = lambda turns, **_kwargs: c._augment_summary_lean(
+            c._with_summary_prefix("## Active Task\nSynthetic checkpoint."),
+            turns,
+        )
+        asks = ["First retained ask.", "Second retained ask.", "Latest retained ask."]
+        replies = ["First visible reply.", "Second visible reply."]
+        msgs: list[dict] = [
+            {
+                "role": "user",
+                "content": c._with_summary_prefix(
+                    "## Active Task\nPrior investigation checkpoint."
+                ),
+            },
+            {"role": "assistant", "content": "Pre-anchor reply."},
+        ]
+        for ask, reply in zip(asks[:2], replies):
+            msgs.extend(
+                [
+                    {"role": "user", "content": ask},
+                    {"role": "assistant", "content": reply},
+                ]
+            )
+        msgs.append({"role": "user", "content": asks[-1]})
+        for i in range(1_400):
+            msgs.extend(_unique_tool_pair(i, 900))
+
+        before = estimate_messages_tokens_rough(msgs)
+        out = c.compress(list(msgs), current_tokens=before, force=True)
+
+        ordinary_users = {
+            m.get("content")
+            for m in out
+            if m.get("role") == "user"
+            and not m.get("_compressed_summary")
+        }
+        ordinary_assistants = {
+            m.get("content")
+            for m in out
+            if m.get("role") == "assistant"
+            and not m.get("_compressed_summary")
+        }
+        assert set(asks) <= ordinary_users
+        assert set(replies) <= ordinary_assistants
+        assert estimate_messages_tokens_rough(out) < c.threshold_tokens
 
 
 

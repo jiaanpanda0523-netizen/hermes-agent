@@ -11,7 +11,7 @@ from __future__ import annotations
 import concurrent.futures
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -158,6 +158,56 @@ class TestResolveContextCompressionTimeouts:
             {"context_timeout_seconds": 90},
             auxiliary_timeout_seconds=300,
         )
+        assert idle == 90.0
+        assert ceiling == 600.0
+
+    def test_merged_schema_default_is_not_mistaken_for_user_override(self):
+        """The production no-argument path receives DEFAULT_CONFIG merged in."""
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "compression": {
+                        "context_timeout_seconds": 120,
+                        "context_total_ceiling_seconds": 600,
+                    }
+                },
+            ),
+            patch("hermes_cli.config.read_raw_config_readonly", return_value={}),
+            patch(
+                "agent.auxiliary_client._effective_aux_timeout",
+                return_value=300,
+            ),
+        ):
+            idle, ceiling = resolve_context_compression_timeouts()
+
+        assert idle == 300.0
+        assert ceiling == 600.0
+
+    def test_raw_user_timeout_presence_preserves_operator_override(self):
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "compression": {
+                        "context_timeout_seconds": 90,
+                        "context_total_ceiling_seconds": 600,
+                    }
+                },
+            ),
+            patch(
+                "hermes_cli.config.read_raw_config_readonly",
+                return_value={
+                    "compression": {"context_timeout_seconds": 90}
+                },
+            ),
+            patch(
+                "agent.auxiliary_client._effective_aux_timeout",
+                return_value=300,
+            ),
+        ):
+            idle, ceiling = resolve_context_compression_timeouts()
+
         assert idle == 90.0
         assert ceiling == 600.0
 

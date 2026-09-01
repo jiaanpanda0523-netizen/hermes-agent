@@ -2305,6 +2305,8 @@ class ContextCompressor(ContextEngine):
         self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
+        self._lean_reinsert_anchor_indices: list[int] = []
+        self._compression_request_overhead_tokens = 0
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
         self._cooldown_persist_failed = False
         self._last_summary_error = None
@@ -6873,15 +6875,99 @@ This compaction should PRIORITISE preserving all information related to the focu
                     messages[cut_idx:], start=cut_idx
                 )
             )
-            if anchored_tail_tokens >= self.threshold_tokens:
+            # Automatic preflight counts system prompt + tool schemas as well
+            # as messages.  Carry the non-message share captured by compress()
+            # into this comparison so a 70K anchored tail plus 20K of schemas
+            # cannot miss an 80K trigger and fall back into the same no-op.
+            anchored_request_tokens = anchored_tail_tokens + max(
+                0, int(getattr(self, "_compression_request_overhead_tokens", 0) or 0)
+            )
+            if anchored_request_tokens >= self.threshold_tokens:
+                anchor_indices: set[int] = set()
+                last_assistant_idx = self._find_last_assistant_message_idx(
+                    messages, head_end
+                )
+                if cut_idx <= last_assistant_idx < budget_cut_idx:
+                    anchor_indices.add(last_assistant_idx)
+
+                wanted_users = getattr(self, "min_tail_user_messages", 1)
+                if not isinstance(wanted_users, int) or isinstance(wanted_users, bool):
+                    wanted_users = 1
+                wanted_users = max(1, wanted_users)
+                user_indices: list[int] = []
+                for idx in range(len(messages) - 1, head_end - 1, -1):
+                    message = messages[idx]
+                    if (
+                        self._is_actionable_user_turn(message)
+                        and not self._is_synthetic_compression_user_turn(message)
+                    ):
+                        user_indices.append(idx)
+                        if len(user_indices) >= wanted_users:
+                            break
+                user_indices.sort()
+                anchor_indices.update(
+                    idx for idx in user_indices if idx < budget_cut_idx
+                )
+                if user_indices:
+                    # If the summary must open a visible sequence as role=user,
+                    # a retained user anchor immediately after it would be
+                    # merged into the summary carrier.  Preserve the preceding
+                    # visible assistant bridge when available so the first
+                    # retained user remains its own ordinary row.
+                    earliest_user = user_indices[0]
+                    for idx in range(earliest_user - 1, head_end - 1, -1):
+                        message = messages[idx]
+                        if message.get("role") == "user":
+                            break
+                        if (
+                            message.get("role") == "assistant"
+                            and not self._is_context_summary_message(message)
+                            and _content_text_for_contains(
+                                message.get("content")
+                            ).strip()
+                        ):
+                            anchor_indices.add(idx)
+                            break
+
+                # Keep the user/assistant recency rows as ordinary messages
+                # while compacting the intervening autonomous tool run.  For
+                # each retained user, carry the last visible assistant reply
+                # before the next retained user as well; this preserves the
+                # documented N-user guarantee without manufacturing adjacent
+                # user-only history.
+                for pos, user_idx in enumerate(user_indices):
+                    interval_end = (
+                        user_indices[pos + 1]
+                        if pos + 1 < len(user_indices)
+                        else budget_cut_idx
+                    )
+                    for idx in range(interval_end - 1, user_idx, -1):
+                        message = messages[idx]
+                        if (
+                            message.get("role") == "assistant"
+                            and not self._is_context_summary_message(message)
+                            and _content_text_for_contains(
+                                message.get("content")
+                            ).strip()
+                        ):
+                            anchor_indices.add(idx)
+                            break
+
+                self._lean_reinsert_anchor_indices = sorted(
+                    idx
+                    for idx in anchor_indices
+                    if head_end <= idx < budget_cut_idx
+                )
                 if not self.quiet_mode:
                     logger.warning(
-                        "Tail anchors protect ~%d tokens (threshold %d); "
-                        "using lean recovery boundary %d instead of %d",
-                        anchored_tail_tokens,
+                        "Tail anchors protect ~%d request tokens (threshold %d); "
+                        "using lean recovery boundary %d instead of %d and "
+                        "reinserting %d recency anchor(s)",
+                        anchored_request_tokens,
                         self.threshold_tokens,
                         budget_cut_idx,
                         cut_idx,
+                        len(self._lean_reinsert_anchor_indices),
                     )
                 cut_idx = budget_cut_idx
 
@@ -7746,6 +7832,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_compress_aborted = False
         self._last_compress_refused_would_grow = False
         self._last_compression_made_progress = False
+        self._lean_reinsert_anchor_indices = []
+        message_tokens_before_prune = estimate_messages_tokens_rough(messages)
+        current_request_tokens = _safe_int(current_tokens)
+        if current_request_tokens is None:
+            current_request_tokens = _safe_int(self.last_prompt_tokens)
+        self._compression_request_overhead_tokens = max(
+            0, int(current_request_tokens or 0) - message_tokens_before_prune
+        )
         # NOTE: do NOT reset _last_summary_auth_failure,
         # _last_summary_network_failure, _last_summary_empty_content_failure,
         # or _last_summary_truncated_failure
@@ -8228,6 +8322,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
 
         tail_messages: List[Dict[str, Any]] = []
+        # A lean recovery escape may summarize a non-contiguous autonomous
+        # tool run while keeping the latest user/assistant recency anchors as
+        # ordinary transcript rows.  Add those anchors first, in original
+        # order; the normal summary-role/merge logic below then preserves
+        # strict alternation at the compaction boundary.
+        _reinsert_indices = getattr(self, "_lean_reinsert_anchor_indices", [])
+        for i in _reinsert_indices:
+            if not (compress_start <= i < compress_end):
+                continue
+            msg = _fresh_compaction_message_copy(messages[i])
+            stripped = self._strip_context_summary_handoff_message(msg)
+            if stripped is not None:
+                tail_messages.append(stripped)
         # Start at tail_start (not compress_end): the restart-decay scan may
         # have advanced it past a summary that sat beyond compress_end
         # (#57835). summary_indices rows are already rehydrated; the strip

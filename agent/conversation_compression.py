@@ -1101,15 +1101,34 @@ def resolve_context_compression_timeouts(
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
     cfg = compression_cfg
+    explicit_idle = False
     if cfg is None:
         try:
-            from hermes_cli.config import load_config
+            from hermes_cli.config import load_config, read_raw_config_readonly
 
             raw = load_config()
             maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
             cfg = maybe if isinstance(maybe, dict) else {}
+            # load_config() deep-merges DEFAULT_CONFIG, so key presence in
+            # ``cfg`` cannot distinguish the shipped 120-second default from
+            # an operator override.  Read the raw file only for presence; the
+            # behavioral value still comes from the canonical merged config.
+            raw_user = read_raw_config_readonly()
+            raw_compression = (
+                raw_user.get("compression", {})
+                if isinstance(raw_user, dict)
+                else {}
+            )
+            explicit_idle = bool(
+                isinstance(raw_compression, dict)
+                and "context_timeout_seconds" in raw_compression
+            )
         except Exception:
             cfg = {}
+    elif isinstance(cfg, dict):
+        # A supplied compression sub-config is an explicit caller contract;
+        # preserve its 0/positive override semantics exactly.
+        explicit_idle = "context_timeout_seconds" in cfg
     if auxiliary_timeout_seconds is None and compression_cfg is None:
         try:
             from agent.auxiliary_client import _effective_aux_timeout
@@ -1119,7 +1138,6 @@ def resolve_context_compression_timeouts(
             )
         except Exception:
             auxiliary_timeout_seconds = None
-    explicit_idle = False
     if isinstance(cfg, dict):
         raw_idle = cfg.get("context_timeout_seconds")
         if raw_idle is not None:
@@ -1127,7 +1145,6 @@ def resolve_context_compression_timeouts(
                 parsed = float(raw_idle)
                 # Explicit 0/negative disables; positive values win.
                 idle = parsed
-                explicit_idle = True
             except (TypeError, ValueError):
                 pass
         raw_ceiling = cfg.get("context_total_ceiling_seconds")
