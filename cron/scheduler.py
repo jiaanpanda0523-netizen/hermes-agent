@@ -5592,6 +5592,33 @@ def run_job(
             EMPTY_PAYLOAD_ERROR,
         )
 
+    # Company agent cron is an execution path, not merely a timer. When the
+    # Anver CURRENT cutover is enabled it must carry the same compiled binding
+    # as native Kanban work. Pure ``no_agent`` script jobs returned above and
+    # remain available for safe non-writing automation.
+    from hermes_cli.anver_current_admission import current_admission_required
+
+    if current_admission_required():
+        stored_prompt = str(job.get("prompt") or "")
+        from hermes_cli.anver_current_admission import current_admission_rejection
+
+        rejection = current_admission_rejection(stored_prompt)
+        if rejection is not None:
+            reason = {
+                "missing_current_contract_binding": "FAIL_CLOSED_MISSING_CURRENT_CONTRACT",
+                "invalid_current_contract_binding": "FAIL_CLOSED_INVALID_CURRENT_CONTRACT",
+            }.get(rejection, "FAIL_CLOSED_" + rejection.upper())
+            blocked_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Status:** BLOCKED\n\n"
+                f"{reason}: agent-backed cron did not carry a valid CURRENT binding; "
+                "no agent, resume, provider, or tool call was started.\n"
+            )
+            logger.warning("Job '%s' (ID: %s): %s", job_name, job_id, reason)
+            return False, blocked_doc, "", reason
+
     # ---------------------------------------------------------------
     # Monitor gate — hash-suppressed change detection (see cron/monitor.py).
     # Runs BEFORE any agent machinery is constructed so an unchanged tick

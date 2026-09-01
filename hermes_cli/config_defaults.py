@@ -2804,6 +2804,14 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Optional company-runtime admission bridge. Off upstream by default;
+        # deployments enable it only when an exact Anver CURRENT authority
+        # checkout and immutable SHA are configured.
+        "current_admission": {
+            "mode": "off",
+            "authority_root": "",
+            "authority_sha": "",
+        },
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

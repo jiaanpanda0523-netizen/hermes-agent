@@ -4614,6 +4614,42 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _anver_current_admission_required() -> bool:
+    from hermes_cli.anver_current_admission import current_admission_required
+
+    return current_admission_required()
+
+
+def _admit_anver_current_operation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    operation: str,
+) -> bool:
+    """Fail closed for native task mutations without a CURRENT binding."""
+    if not _anver_current_admission_required():
+        return True
+    row = conn.execute("SELECT body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    body = row["body"] if row else None
+    from hermes_cli.anver_current_admission import current_admission_rejection
+
+    reason = current_admission_rejection(
+        body,
+        authority_bodies=[
+            candidate["body"] for candidate in conn.execute("SELECT body FROM tasks").fetchall()
+        ],
+    )
+    if reason is None:
+        return True
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "current_admission_rejected",
+            {"operation": operation, "reason": reason},
+        )
+    return False
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
@@ -4637,6 +4673,8 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    if not _admit_anver_current_operation(conn, task_id, operation="claim"):
+        return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4765,6 +4803,8 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    if not _admit_anver_current_operation(conn, task_id, operation="claim_review"):
+        return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -5403,6 +5443,8 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    if not _admit_anver_current_operation(conn, task_id, operation="complete"):
+        return False
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
