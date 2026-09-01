@@ -1431,6 +1431,36 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            safe_capability_recovery = None
+            safe_human_escalation = None
+            if (
+                str(initial_status) == "blocked"
+                and kb._anver_current_admission_required()
+            ):
+                from hermes_cli.anver_current_admission import (
+                    current_admission_rejection,
+                    validate_human_escalation,
+                )
+
+                current_rejection = current_admission_rejection(
+                    body,
+                    authority_bodies=[
+                        row["body"]
+                        for row in conn.execute("SELECT body FROM tasks").fetchall()
+                    ] + [body],
+                )
+                if current_rejection is not None:
+                    raise ValueError(
+                        f"current_admission_rejected:{current_rejection}"
+                    )
+                (
+                    safe_capability_recovery,
+                    safe_human_escalation,
+                ) = validate_human_escalation(
+                    kb.redact_review_value(args.get("capability_recovery")),
+                    kb.redact_review_value(args.get("human_escalation")),
+                )
+
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
@@ -1470,6 +1500,18 @@ def _handle_create(args: dict, **kw) -> str:
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
+            if safe_capability_recovery is not None:
+                with kb.write_txn(conn):
+                    kb._append_event(
+                        conn,
+                        new_tid,
+                        "human_escalation_admitted",
+                        {
+                            "operation": "create_blocked",
+                            "capability_recovery": safe_capability_recovery,
+                            "human_escalation": safe_human_escalation,
+                        },
+                    )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1872,7 +1914,8 @@ KANBAN_BLOCK_SCHEMA = {
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (a proven irreducible human boundary), "
         "'capability' (a proven irreducible human boundary after recovery), "
-        "or 'transient' (a technical failure that may clear). TOOL_PATH_FAILED "
+        "or 'transient' (a technical failure that CURRENT routes to non-human "
+        "todo for safe retry/resume). TOOL_PATH_FAILED "
         "does not mean HUMAN_ONLY. For CURRENT tasks, needs_input, capability, "
         "and legacy untyped human blocks require a task-bound capability_recovery "
         "packet covering every existing authorized path; any available/recovered "
@@ -1903,8 +1946,9 @@ KANBAN_BLOCK_SCHEMA = {
                 "enum": ["dependency", "needs_input", "capability", "transient"],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
-                    "Omit only if none apply."
+                    "resumes automatically; CURRENT 'transient' also waits "
+                    "in non-human todo; only needs_input/capability are human "
+                    "authority surfaces. Omit only if none apply."
                 ),
             },
             "capability_recovery": {
@@ -2356,12 +2400,19 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "string",
                 "enum": ["running", "blocked"],
                 "description": (
-                    "Initial card status. Use 'blocked' for tasks that "
-                    "require immediate human ops (R3 gate) to skip the "
-                    "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
+                    "Initial card status. CURRENT workers may use 'blocked' "
+                    "only with a valid CURRENT-bound body plus complete "
+                    "capability_recovery and human_escalation packets; one "
+                    "failed tool path is not enough. Defaults to 'running', "
+                    "which preserves the usual dispatch path."
                 ),
             },
+            "capability_recovery": KANBAN_BLOCK_SCHEMA["parameters"][
+                "properties"
+            ]["capability_recovery"],
+            "human_escalation": KANBAN_BLOCK_SCHEMA["parameters"][
+                "properties"
+            ]["human_escalation"],
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},

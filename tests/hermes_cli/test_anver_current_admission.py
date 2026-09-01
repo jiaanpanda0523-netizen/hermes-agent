@@ -284,15 +284,19 @@ def test_tool_path_failure_cannot_be_promoted_to_founder_human_only(
             )
 
         assert kb.get_task(conn, task_id).status == "running"
-        with pytest.raises(ValueError, match="capability_recovery_missing"):
-            kb.block_task(
-                conn,
-                task_id,
-                kind="transient",
-                reason="Founder must manually update the Chrome extension.",
-                expected_run_id=claimed.current_run_id,
-            )
-        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.block_task(
+            conn,
+            task_id,
+            kind="transient",
+            reason="Please manually update the Chrome extension.",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, task_id).status == "todo"
+        transient_wait = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "transient_wait"
+        ][-1]
+        assert transient_wait.payload["human_surface"] is False
 
 
 def test_available_qa_identity_path_cannot_be_promoted_to_founder_human_only(
@@ -423,6 +427,77 @@ def test_real_kanban_tool_surface_rejects_unrecovered_founder_escalation(
             "kind": "capability",
             "reason": "capability_recovery_missing",
         }
+
+
+def test_real_kanban_create_surface_rejects_direct_human_block(
+    tmp_path: Path, monkeypatch,
+):
+    """A worker cannot create an immediately human-blocked CURRENT child."""
+    from tools import kanban_tools as kt
+
+    root, sha = _authority_repo(tmp_path)
+    db_path = tmp_path / "kanban.db"
+    body = _bound_body(_contract(1, "8" * 64))
+    monkeypatch.setenv("ANVER_CURRENT_ADMISSION_MODE", "required")
+    monkeypatch.setenv("ANVER_CURRENT_AUTHORITY_ROOT", str(root))
+    monkeypatch.setenv("ANVER_CURRENT_AUTHORITY_SHA", sha)
+    with kb.connect(db_path) as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="CURRENT parent",
+            body=body,
+            assignee="writer",
+        )
+        claimed = kb.claim_task(conn, parent_id, claimer="current-writer")
+        assert claimed is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    monkeypatch.setattr(
+        kt,
+        "_connect",
+        lambda board=None: (kb, kb.connect(db_path)),
+    )
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "Founder update extension",
+                "body": body,
+                "assignee": "writer",
+                "initial_status": "blocked",
+            }
+        )
+    )
+    assert "capability_recovery_missing" in result["error"]
+    with kb.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = ?",
+            ("Founder update extension",),
+        ).fetchone()[0] == 0
+
+    admitted = json.loads(
+        kt._handle_create(
+            {
+                "title": "Named signatory action only",
+                "body": body,
+                "assignee": "writer",
+                "initial_status": "blocked",
+                "capability_recovery": _capability_recovery(),
+                "human_escalation": _legal_signature_escalation(),
+            }
+        )
+    )
+    assert admitted["ok"] is True
+    with kb.connect(db_path) as conn:
+        child = kb.get_task(conn, admitted["task_id"])
+        assert child.status == "blocked"
+        event = [
+            item for item in kb.list_events(conn, child.id)
+            if item.kind == "human_escalation_admitted"
+        ][-1]
+        assert event.payload["operation"] == "create_blocked"
+        assert event.payload["capability_recovery"]["disposition"] == "TRUE_HUMAN_ONLY"
 
 
 def test_required_current_admission_rejects_a_superseded_bound_task(

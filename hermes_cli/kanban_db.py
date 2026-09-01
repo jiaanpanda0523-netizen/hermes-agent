@@ -6326,9 +6326,10 @@ def block_task(
       of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
       forcing a human-in-the-loop triage decision.
 
-    * ``transient`` — treated like a generic block for routing, but a worker
-      can use it to signal "this might clear on its own"; it still participates
-      in the loop breaker so a forever-flaky task eventually escalates.
+    * ``transient`` — under required CURRENT admission, routes to non-human
+      ``todo`` so a safe retry/resume can re-admit it without projecting a
+      failed tool path into human authority. Legacy boards keep the historical
+      blocked/loop-breaker behavior while CURRENT admission is off.
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
@@ -6340,10 +6341,11 @@ def block_task(
     if not _admit_anver_current_operation(conn, task_id, operation="block"):
         return False
 
+    current_admission_enabled = _anver_current_admission_required()
     safe_capability_recovery = None
     safe_human_escalation = None
     human_block_kinds = {None, "needs_input", "capability"}
-    if _anver_current_admission_required():
+    if current_admission_enabled:
         from hermes_cli.anver_current_admission import (
             reason_requests_human_action,
             validate_human_escalation,
@@ -6402,6 +6404,55 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+
+        # CURRENT transient failures are technical retry state, never a human
+        # authority surface. Keep the history and ended run, but park in the
+        # existing todo/resume flow without firing the human-facing lifecycle
+        # hook. A later claim is re-checked by CURRENT admission.
+        if kind == "transient" and current_admission_enabled:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'todo',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = ?
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                (kind, task_id) if expected_run_id is None
+                else (kind, task_id, int(expected_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="blocked",
+                status="blocked",
+                summary=reason,
+            )
+            if run_id is None and reason:
+                run_id = _synthesize_ended_run(
+                    conn,
+                    task_id,
+                    outcome="blocked",
+                    summary=reason,
+                )
+            _append_event(
+                conn,
+                task_id,
+                "transient_wait",
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "source_status": source_status,
+                    "human_surface": False,
+                },
+                run_id=run_id,
+            )
+            return True
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
