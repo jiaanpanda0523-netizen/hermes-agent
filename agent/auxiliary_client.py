@@ -3234,6 +3234,10 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         logger.debug("Could not import PROVIDER_REGISTRY for API-key fallback")
         return None, None
 
+    def _resolved(client: Any, model: Optional[str], provider_id: str):
+        _tag_effective_provider(client, provider_id)
+        return client, model
+
     for provider_id, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
             continue
@@ -3252,7 +3256,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                     continue
             except ImportError:
                 pass
-            return _try_anthropic()
+            client, model = _try_anthropic()
+            return _resolved(client, model, provider_id)
 
         pool_present, entry = _select_pool_entry(provider_id)
         if pool_present:
@@ -3270,7 +3275,11 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
                 if is_native_gemini_base_url(base_url):
-                    return GeminiNativeClient(api_key=api_key, base_url=base_url), model
+                    return _resolved(
+                        GeminiNativeClient(api_key=api_key, base_url=base_url),
+                        model,
+                        provider_id,
+                    )
             extra = {}
             if base_url_host_matches(base_url, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
@@ -3293,7 +3302,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 extra["default_headers"] = _merged_aux
             _client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
             _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
-            return _client, model
+            return _resolved(_client, model, provider_id)
 
         creds = resolve_api_key_provider_credentials(provider_id)
         api_key = str(creds.get("api_key", "")).strip()
@@ -3310,7 +3319,11 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
             if is_native_gemini_base_url(base_url):
-                return GeminiNativeClient(api_key=api_key, base_url=base_url), model
+                return _resolved(
+                    GeminiNativeClient(api_key=api_key, base_url=base_url),
+                    model,
+                    provider_id,
+                )
         extra = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
             extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
@@ -3333,7 +3346,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             extra["default_headers"] = _merged_aux2
         _client = _create_openai_client(api_key=api_key, base_url=base_url, **extra)
         _client = _maybe_wrap_anthropic(_client, model, api_key, raw_base_url)
-        return _client, model
+        return _resolved(_client, model, provider_id)
 
     return None, None
 
@@ -6058,7 +6071,10 @@ def _try_payment_fallback(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
             )
-            return client, model, label
+            effective_provider = _effective_provider_for_client(client, label)
+            if effective_provider == "local/custom":
+                effective_provider = "custom"
+            return client, model, effective_provider
         tried.append(label)
 
     logger.warning(
@@ -6703,7 +6719,10 @@ def _resolve_auto_route(
                             label, model or "default", ", ".join(tried))
             else:
                 logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
-            return client, model, label
+            effective_provider = _effective_provider_for_client(client, label)
+            if effective_provider == "local/custom":
+                effective_provider = "custom"
+            return client, model, effective_provider
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "

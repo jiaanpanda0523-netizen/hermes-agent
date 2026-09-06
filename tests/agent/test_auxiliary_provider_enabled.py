@@ -183,38 +183,78 @@ def test_strict_vision_route_skips_disabled_provider(
     resolve_backend.assert_not_called()
 
 
-def test_sync_cache_entry_is_evicted_after_provider_is_disabled(
+def _auto_discovery_config(deepseek_enabled):
+    return {
+        "model": {"provider": "auto", "default": ""},
+        "providers": {
+            "deepseek": {"enabled": deepseek_enabled},
+            "openrouter": {"enabled": False},
+            "nous": {"enabled": False},
+            "custom": {"enabled": False},
+        },
+    }
+
+
+def _fake_api_key_credentials(provider_id):
+    if provider_id == "deepseek":
+        return {
+            "api_key": "present-but-fake",
+            "base_url": "https://api.deepseek.com/v1",
+        }
+    return {}
+
+
+def _fake_aux_model(provider_id, **_kwargs):
+    return "boundary-test-model" if provider_id == "deepseek" else ""
+
+
+def test_sync_auto_cache_entry_is_evicted_after_concrete_provider_is_disabled(
     tmp_path, monkeypatch
 ):
     hermes_home = _write_config(
         tmp_path,
         monkeypatch,
-        {"providers": {"deepseek": {"enabled": True}}},
+        _auto_discovery_config(True),
     )
 
     from agent.auxiliary_client import _client_cache, _get_cached_client
 
     cached_client = MagicMock()
-    with patch(
-        "agent.auxiliary_client.resolve_provider_client",
-        return_value=(cached_client, "boundary-test-model"),
-    ) as resolve_client:
+    cached_client.close = MagicMock(return_value=None)
+    with (
+        patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            side_effect=_fake_api_key_credentials,
+        ),
+        patch(
+            "agent.auxiliary_client._get_aux_model_for_provider",
+            side_effect=_fake_aux_model,
+        ),
+        patch(
+            "agent.auxiliary_client._create_openai_client",
+            return_value=cached_client,
+        ) as create_client,
+    ):
         first_client, _ = _get_cached_client(
-            "deepseek", model="boundary-test-model"
+            "auto",
+            main_runtime={"provider": "auto", "model": ""},
+            task="compression",
         )
         (hermes_home / "config.yaml").write_text(
-            json.dumps({"providers": {"deepseek": {"enabled": False}}}),
+            json.dumps(_auto_discovery_config(False)),
             encoding="utf-8",
         )
-        resolve_client.return_value = (None, None)
         second_client, second_model = _get_cached_client(
-            "deepseek", model="boundary-test-model"
+            "auto",
+            main_runtime={"provider": "auto", "model": ""},
+            task="compression",
         )
 
     assert first_client is cached_client
+    assert getattr(first_client, "_hermes_aux_effective_provider") == "deepseek"
     assert second_client is None
-    assert second_model == "boundary-test-model"
-    assert resolve_client.call_count == 2
+    assert second_model is None
+    create_client.assert_called_once()
     cached_client.close.assert_called_once()
     assert not _client_cache
 
@@ -225,59 +265,104 @@ def test_async_auto_cache_entry_is_evicted_when_effective_provider_is_disabled(
     hermes_home = _write_config(
         tmp_path,
         monkeypatch,
-        {"providers": {"deepseek": {"enabled": True}}},
+        _auto_discovery_config(True),
     )
 
-    from agent.auxiliary_client import (
-        _client_cache,
-        _get_cached_client,
-        _tag_effective_provider,
-    )
+    from agent.auxiliary_client import _client_cache, _get_cached_client
 
     async def exercise_transition():
-        cached_client = MagicMock()
-        cached_client.close = MagicMock(return_value=None)
-        _tag_effective_provider(cached_client, "deepseek")
-        with patch(
-            "agent.auxiliary_client.resolve_provider_client",
-            return_value=(cached_client, "boundary-test-model"),
-        ) as resolve_client:
+        sync_client = MagicMock()
+        async_client = MagicMock()
+        async_client.close = MagicMock(return_value=None)
+        with (
+            patch(
+                "hermes_cli.auth.resolve_api_key_provider_credentials",
+                side_effect=_fake_api_key_credentials,
+            ),
+            patch(
+                "agent.auxiliary_client._get_aux_model_for_provider",
+                side_effect=_fake_aux_model,
+            ),
+            patch(
+                "agent.auxiliary_client._create_openai_client",
+                return_value=sync_client,
+            ) as create_client,
+            patch(
+                "agent.auxiliary_client._to_async_client",
+                side_effect=lambda _client, model, **_kwargs: (async_client, model),
+            ),
+        ):
             first_client, _ = _get_cached_client(
                 "auto",
-                model="boundary-test-model",
                 async_mode=True,
-                main_runtime={
-                    "provider": "deepseek",
-                    "model": "boundary-test-model",
-                },
+                main_runtime={"provider": "auto", "model": ""},
                 task="compression",
             )
-            assert first_client is cached_client
+            assert first_client is async_client
             assert getattr(first_client, "_hermes_aux_effective_provider") == "deepseek"
 
             (hermes_home / "config.yaml").write_text(
-                json.dumps({"providers": {"deepseek": {"enabled": False}}}),
+                json.dumps(_auto_discovery_config(False)),
                 encoding="utf-8",
             )
-            resolve_client.return_value = (None, None)
             second_client, second_model = _get_cached_client(
                 "auto",
-                model="boundary-test-model",
                 async_mode=True,
-                main_runtime={
-                    "provider": "deepseek",
-                    "model": "boundary-test-model",
-                },
+                main_runtime={"provider": "auto", "model": ""},
                 task="compression",
             )
 
         assert second_client is None
-        assert second_model == "boundary-test-model"
-        assert resolve_client.call_count == 2
-        cached_client.close.assert_called_once()
+        assert second_model is None
+        create_client.assert_called_once()
+        async_client.close.assert_called_once()
         assert not _client_cache
 
     asyncio.run(exercise_transition())
+
+
+def test_auto_local_custom_cache_uses_native_custom_identity(
+    tmp_path, monkeypatch
+):
+    config = _auto_discovery_config(False)
+    config["providers"]["custom"]["enabled"] = True
+    hermes_home = _write_config(tmp_path, monkeypatch, config)
+
+    from agent.auxiliary_client import _client_cache, _get_cached_client
+
+    cached_client = MagicMock()
+    cached_client.close = MagicMock(return_value=None)
+    with (
+        patch(
+            "agent.auxiliary_client._try_custom_endpoint",
+            return_value=(cached_client, "local-test-model"),
+        ) as resolve_custom,
+        patch(
+            "agent.auxiliary_client._resolve_api_key_provider",
+            return_value=(None, None),
+        ),
+    ):
+        first_client, _ = _get_cached_client(
+            "auto",
+            main_runtime={"provider": "auto", "model": ""},
+            task="compression",
+        )
+        config["providers"]["custom"]["enabled"] = False
+        (hermes_home / "config.yaml").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        second_client, _ = _get_cached_client(
+            "auto",
+            main_runtime={"provider": "auto", "model": ""},
+            task="compression",
+        )
+
+    assert first_client is cached_client
+    assert getattr(first_client, "_hermes_aux_effective_provider") == "custom"
+    assert second_client is None
+    resolve_custom.assert_called_once()
+    cached_client.close.assert_called_once()
+    assert not _client_cache
 
 
 def test_quota_failure_does_not_activate_disabled_aux_fallback(
