@@ -846,6 +846,51 @@ def _normalize_aux_provider(provider: Optional[str]) -> str:
     return _PROVIDER_ALIASES.get(normalized, normalized)
 
 
+def _aux_provider_is_enabled(*provider_ids: str) -> bool:
+    """Honor the native ``providers.<id>.enabled`` flag in aux routing.
+
+    Auxiliary resolution has its own provider router and therefore does not
+    pass through ``runtime_provider.resolve_runtime_provider()``, where this
+    flag is enforced for the main agent. Check both the caller's raw id and
+    its normalized id so aliases and named custom providers cannot bypass a
+    disabled config entry.
+
+    A config read failure is fail-closed: routing to a provider whose enabled
+    state could not be verified would undo the user's explicit disablement.
+    """
+    try:
+        from hermes_cli.config import is_provider_enabled, load_config_readonly
+
+        config = load_config_readonly()
+    except ImportError:
+        # Keep early/bootstrap imports compatible with stripped embeddings
+        # that do not ship the CLI config module.
+        return True
+    except Exception as exc:
+        logger.error("Auxiliary provider enabled-state check failed: %s", exc)
+        return False
+
+    providers = config.get("providers") if isinstance(config, dict) else None
+    if not isinstance(providers, dict):
+        return True
+
+    for raw_id in provider_ids:
+        provider_id = str(raw_id or "").strip().lower()
+        if not provider_id or provider_id in {"auto", "api-key"}:
+            continue
+        if provider_id.startswith("custom:"):
+            provider_id = provider_id.split(":", 1)[1].strip()
+        block = providers.get(provider_id)
+        if isinstance(block, dict) and not is_provider_enabled(block):
+            logger.info(
+                "Auxiliary provider %s is disabled by providers.%s.enabled",
+                provider_id,
+                provider_id,
+            )
+            return False
+    return True
+
+
 # Sentinel: when returned by _fixed_temperature_for_model(), callers must
 # strip the ``temperature`` key from API kwargs entirely so the provider's
 # server-side default applies.  Kimi/Moonshot models manage temperature
@@ -3192,6 +3237,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
     for provider_id, pconfig in PROVIDER_REGISTRY.items():
         if pconfig.auth_type != "api_key":
             continue
+        if not _aux_provider_is_enabled(provider_id):
+            continue
         if _is_provider_unhealthy(provider_id):
             logger.debug("Auxiliary api-key chain: %s is unhealthy, skipping", provider_id)
             continue
@@ -4502,11 +4549,19 @@ def _get_provider_chain() -> List[tuple]:
     provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
     a caller explicitly requests it with a model.
     """
-    return [
+    candidates = [
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
         ("local/custom", _try_custom_endpoint),
         ("api-key", _resolve_api_key_provider),
+    ]
+    return [
+        (label, resolver)
+        for label, resolver in candidates
+        if label == "api-key"
+        or _aux_provider_is_enabled(
+            "custom" if label == "local/custom" else label
+        )
     ]
 
 
@@ -6868,6 +6923,13 @@ def resolve_provider_client(
                 explicit_base_url = None
                 explicit_api_key = None
 
+    # Match the main runtime's native provider-disable contract before any
+    # explicit endpoint, credential, auto-discovery, or fallback branch can
+    # construct a client. In particular, provider="custom" plus an explicit
+    # base_url must not bypass providers.custom.enabled: false.
+    if provider != "auto" and not _aux_provider_is_enabled(original_provider, provider):
+        return None, None
+
     # Universal model-resolution fallback for concrete providers. ``auto`` is
     # intentionally excluded: `_resolve_auto(main_runtime=...)` returns the
     # model paired with the provider it actually selected. Pre-filling an auto
@@ -7831,6 +7893,8 @@ def _resolve_strict_vision_backend(
     model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     provider = _normalize_vision_provider(provider)
+    if not _aux_provider_is_enabled(provider):
+        return None, None
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
     if provider == "openrouter":
