@@ -1,5 +1,6 @@
 """Behavior tests for native provider disablement in auxiliary routing."""
 
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
@@ -70,6 +71,50 @@ def test_api_key_auto_discovery_skips_disabled_provider_with_key_present(
     create_client.assert_not_called()
 
 
+def test_same_credential_isolated_between_disabled_internal_and_allowed_customer_home(
+    tmp_path, monkeypatch
+):
+    internal_home = tmp_path / "internal-home"
+    internal_home.mkdir()
+    (internal_home / "config.yaml").write_text(
+        json.dumps({"providers": {"deepseek": {"enabled": False}}}),
+        encoding="utf-8",
+    )
+    customer_home = tmp_path / "anmoni-customer-home"
+    customer_home.mkdir()
+    (customer_home / "config.yaml").write_text(
+        json.dumps({"providers": {"deepseek": {"enabled": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "same-fake-credential")
+
+    from agent.auxiliary_client import resolve_provider_client
+
+    fake_client = MagicMock()
+    with patch(
+        "agent.auxiliary_client._create_openai_client",
+        return_value=fake_client,
+    ) as create_client:
+        monkeypatch.setenv("HERMES_HOME", str(internal_home))
+        internal_client, _ = resolve_provider_client(
+            "deepseek",
+            model="boundary-test-model",
+            explicit_base_url="https://api.deepseek.com/v1",
+            explicit_api_key="same-fake-credential",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(customer_home))
+        customer_client, _ = resolve_provider_client(
+            "deepseek",
+            model="boundary-test-model",
+            explicit_base_url="https://api.deepseek.com/v1",
+            explicit_api_key="same-fake-credential",
+        )
+
+    assert internal_client is None
+    assert customer_client is fake_client
+    create_client.assert_called_once()
+
+
 def test_auto_route_skips_disabled_main_and_discovery_candidates(
     tmp_path, monkeypatch
 ):
@@ -138,6 +183,103 @@ def test_strict_vision_route_skips_disabled_provider(
     resolve_backend.assert_not_called()
 
 
+def test_sync_cache_entry_is_evicted_after_provider_is_disabled(
+    tmp_path, monkeypatch
+):
+    hermes_home = _write_config(
+        tmp_path,
+        monkeypatch,
+        {"providers": {"deepseek": {"enabled": True}}},
+    )
+
+    from agent.auxiliary_client import _client_cache, _get_cached_client
+
+    cached_client = MagicMock()
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(cached_client, "boundary-test-model"),
+    ) as resolve_client:
+        first_client, _ = _get_cached_client(
+            "deepseek", model="boundary-test-model"
+        )
+        (hermes_home / "config.yaml").write_text(
+            json.dumps({"providers": {"deepseek": {"enabled": False}}}),
+            encoding="utf-8",
+        )
+        resolve_client.return_value = (None, None)
+        second_client, second_model = _get_cached_client(
+            "deepseek", model="boundary-test-model"
+        )
+
+    assert first_client is cached_client
+    assert second_client is None
+    assert second_model == "boundary-test-model"
+    assert resolve_client.call_count == 2
+    cached_client.close.assert_called_once()
+    assert not _client_cache
+
+
+def test_async_auto_cache_entry_is_evicted_when_effective_provider_is_disabled(
+    tmp_path, monkeypatch
+):
+    hermes_home = _write_config(
+        tmp_path,
+        monkeypatch,
+        {"providers": {"deepseek": {"enabled": True}}},
+    )
+
+    from agent.auxiliary_client import (
+        _client_cache,
+        _get_cached_client,
+        _tag_effective_provider,
+    )
+
+    async def exercise_transition():
+        cached_client = MagicMock()
+        cached_client.close = MagicMock(return_value=None)
+        _tag_effective_provider(cached_client, "deepseek")
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(cached_client, "boundary-test-model"),
+        ) as resolve_client:
+            first_client, _ = _get_cached_client(
+                "auto",
+                model="boundary-test-model",
+                async_mode=True,
+                main_runtime={
+                    "provider": "deepseek",
+                    "model": "boundary-test-model",
+                },
+                task="compression",
+            )
+            assert first_client is cached_client
+            assert getattr(first_client, "_hermes_aux_effective_provider") == "deepseek"
+
+            (hermes_home / "config.yaml").write_text(
+                json.dumps({"providers": {"deepseek": {"enabled": False}}}),
+                encoding="utf-8",
+            )
+            resolve_client.return_value = (None, None)
+            second_client, second_model = _get_cached_client(
+                "auto",
+                model="boundary-test-model",
+                async_mode=True,
+                main_runtime={
+                    "provider": "deepseek",
+                    "model": "boundary-test-model",
+                },
+                task="compression",
+            )
+
+        assert second_client is None
+        assert second_model == "boundary-test-model"
+        assert resolve_client.call_count == 2
+        cached_client.close.assert_called_once()
+        assert not _client_cache
+
+    asyncio.run(exercise_transition())
+
+
 def test_quota_failure_does_not_activate_disabled_aux_fallback(
     tmp_path, monkeypatch
 ):
@@ -146,7 +288,10 @@ def test_quota_failure_does_not_activate_disabled_aux_fallback(
         monkeypatch,
         {
             "model": {"provider": "openai-codex", "default": "gpt-test"},
-            "providers": {"deepseek": {"enabled": False}},
+            "providers": {
+                "deepseek": {"enabled": False},
+                "custom": {"enabled": False},
+            },
             "auxiliary": {
                 "compression": {
                     "provider": "openai-codex",
@@ -157,7 +302,12 @@ def test_quota_failure_does_not_activate_disabled_aux_fallback(
                             "model": "boundary-test-model",
                             "base_url": "https://api.deepseek.com/v1",
                             "api_key": "present-but-disabled",
-                        }
+                        },
+                        {
+                            "provider": "custom",
+                            "model": "local-test-model",
+                            "base_url": "http://127.0.0.1:11434/v1",
+                        },
                     ],
                 }
             },
@@ -172,6 +322,11 @@ def test_quota_failure_does_not_activate_disabled_aux_fallback(
     primary_client = MagicMock()
     primary_client.base_url = "https://allowed-primary.example/v1"
     primary_client.chat.completions.create.side_effect = quota_error
+    blocked_network_constructors = []
+
+    def record_blocked_constructor(*args, **kwargs):
+        blocked_network_constructors.append(kwargs.get("base_url", ""))
+        raise AssertionError("disabled fallback constructed a client")
 
     with (
         patch(
@@ -180,7 +335,7 @@ def test_quota_failure_does_not_activate_disabled_aux_fallback(
         ),
         patch(
             "agent.auxiliary_client._create_openai_client",
-            side_effect=AssertionError("disabled fallback constructed a client"),
+            side_effect=record_blocked_constructor,
         ) as create_client,
         patch(
             "agent.auxiliary_client._try_main_agent_model_fallback",
@@ -199,3 +354,4 @@ def test_quota_failure_does_not_activate_disabled_aux_fallback(
 
     primary_client.chat.completions.create.assert_called_once()
     create_client.assert_not_called()
+    assert blocked_network_constructors == []

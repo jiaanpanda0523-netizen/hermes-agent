@@ -8668,7 +8668,14 @@ def _get_cached_client(
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]
-            if async_mode:
+            cached_provider = _effective_provider_for_client(cached_client, provider)
+            if not _aux_provider_is_enabled(provider, cached_provider):
+                # Provider policy can change while a long-running gateway is
+                # alive. Never let a client created under the old policy
+                # bypass the current native enabled flag through this cache.
+                _close_cached_client(cached_client, close_async=async_mode)
+                del _client_cache[cache_key]
+            elif async_mode:
                 # Validate: the cached client must be bound to the CURRENT,
                 # OPEN loop.  If the loop changed or was closed, the httpx
                 # transport inside is dead — force-close and replace.
